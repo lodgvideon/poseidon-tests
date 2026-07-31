@@ -49,7 +49,7 @@ allocation counts that no container-level metric can provide.
 
 | Metric | Source |
 |---|---|
-| CPU (millicores) | `/cpu/classes/total` − `/cpu/classes/idle`, over the plateau |
+| CPU (millicores) | `/proc/self/stat` utime+stime (Linux) — see the caveat below |
 | Allocations/request | Δ`/gc/heap/allocs:objects` ÷ plateau requests |
 | Bytes/request | Δ`/gc/heap/allocs:bytes` ÷ plateau requests |
 | RSS avg / peak | `/proc/self/status` `VmRSS`, sampled every 2s during the plateau |
@@ -57,6 +57,14 @@ allocation counts that no container-level metric can provide.
 Prometheus + Grafana scrape the same numbers continuously for a live view of
 the run; pprof heap profiles at both plateau boundaries give per-callsite
 allocation attribution.
+
+**The CPU column is weak and labelled as such.** At 200 RPS the driver runs at
+5–8% of one core, and running one arm against itself gives a 13.4% coefficient
+of variation — a ~30% minimum resolvable delta between single runs. `report.py`
+refuses to give a verdict below that, printing "below noise floor" instead. The
+allocation columns are exact runtime counters and are the trustworthy output.
+Go's own `/cpu/classes/*` metrics are **not** used, because they only refresh
+during a GC cycle and freeze entirely on a low-allocating arm.
 
 ## Running it
 
@@ -143,14 +151,14 @@ sees far less benefit:
 
 | | vs `net/http` | vs `net/http` **with a pooled read buffer** |
 |---|---:|---:|
-| H1 bytes/req | −90.2% | **−63%** |
-| H2 bytes/req | −94.2% | **−84%** |
+| H1 bytes/req | −89.8% | **−60.3%** |
+| H2 bytes/req | −94.2% | **−82.9%** |
 
 Measure it yourself with the diagnostic arm: `-arm standard-pooled` (H1/H2
 only; deliberately outside the scored matrix).
 
-**The allocation-count row is not affected by this** — 67–82% of that win
-survives the pooled control, because it comes from `net/http`'s per-request
+**The allocation-count row is not affected by this** — poseidon is still
+−27.3% (H1) and −73.9% (H2) against the pooled arm, because it comes from `net/http`'s per-request
 object graph rather than from body buffering. See `docs/FINDINGS.md`.
 
 Read the **Validity** section first. It flags anything that makes the numbers

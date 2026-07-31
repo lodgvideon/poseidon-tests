@@ -519,11 +519,14 @@ except the response body is materialised into a `sync.Pool`'d buffer instead of 
 
 | | poseidon vs `net/http` | poseidon vs `net/http` **with a pooled read buffer** |
 |---|---:|---:|
-| H1 bytes/req | −90.2% | **−63%** |
-| H2 bytes/req | −94.2% | **−84%** |
+| H1 bytes/req | −89.8% | **−60.3%** |
+| H2 bytes/req | −94.2% | **−82.9%** |
 
-So roughly **four fifths of the H1 delta and two thirds of the H2 delta is response-body
-buffer reuse** — something any `net/http` consumer can do today without changing client
+*(These are the in-cluster figures, measured with the pooled arm run as a real cell of the
+matrix. They confirm the local projection that produced them — −63% / −84% — to within
+three points.)*
+
+So **83% of the H1 delta and 70% of the H2 delta is response-body buffer reuse** — something any `net/http` consumer can do today without changing client
 libraries. Body volume across the three arms agreed to 0.005–0.238%, 0 errors in all 12
 cells, and the local headline reproduced the in-cluster one (H1 −89.9% local vs −90.2%
 in-cluster), so the split carries over.
@@ -533,9 +536,9 @@ its read buffer, poseidon still allocates 63% (H1) and 84% (H2) fewer bytes* —
 not paying `x/net/http2`'s per-stream `dataChunkPool` refill (~5.2 KB/req, H2) or
 `net/http`'s 32 KiB request-write copy buffer (~2.2 KB/req, H1).
 
-**This correction does not extend to the allocation-count column.** 67–82% of the count
-win survives the pooled control (H1 poseidon 39.0 vs pooled 53.3 vs standard 59.9; H2 11.3
-vs 42.5 vs 49.5), because `io.ReadAll`'s cost is byte-volume-dominated while the object
+**This correction does not extend to the allocation-count column.** The count win survives
+the pooled control — in-cluster, poseidon is still **−27.3%** (H1) and **−73.9%** (H2)
+against the pooled arm (H1 38.6 vs 53.1 vs 60.1; H2 11.2 vs 42.8 vs 49.4) — because `io.ReadAll`'s cost is byte-volume-dominated while the object
 count is dominated by `net/http`'s per-request object graph — `Request`, parsed and cloned
 `URL`, two header maps, the cancel-context chain, `Response` — which pooling a buffer does
 nothing about. The **−35.8% / −77.9% allocation-count headline stands** as a genuine
@@ -602,10 +605,19 @@ cost is per-*packet* and the packet rate is set by the operating system.
   for a duration, making absolute `CPUBusySeconds` a large negative number. Deltas were
   unaffected, which is why it survived. Now computed from raw 100 ns ticks.
 
-### Still open
+### Answered by the next in-cluster run
 
-- Does the H3 allocation verdict survive matched topology **in-cluster**? The fix is in;
-  the causal test (−3.0% allocs at `-conns 1`) was local Windows only.
+**The H3 allocation verdict survives matched topology.** Re-measured in-cluster with both
+arms on one connection: **+7.4%**, against +7.6% at eight. So unlike the gRPC RSS gap —
+which vanished entirely once topology was matched — this one is not a confound. It is real
+client cost, and it belongs to the per-packet allocation sites in #345 and #348. Matching
+the topology was still right; it simply was not the explanation here.
+
+**The three-way byte decomposition reproduces in-cluster**, within three points of the
+local projection, and is now measured rather than extrapolated. The pooled arm ran as a
+real cell against the same target under the same load.
+
+### Still open
 - Two CPU instruments the harness already records (`cpu_busy_seconds` from the OS,
   `cpu_runtime_seconds` from `runtime/metrics`) disagree by 1.15–1.54×, and the
   disagreement correlates with the arm rather than cancelling — enough to flip the H1
