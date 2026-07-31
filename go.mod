@@ -4,7 +4,7 @@ go 1.26.4
 
 require (
 	github.com/go-chi/chi/v5 v5.3.1
-	github.com/lodgvideon/poseidon-http-client v0.11.0
+	github.com/lodgvideon/poseidon-http-client v0.11.1-0.20260731201745-bf099faf9856
 	github.com/quic-go/quic-go v0.61.0
 	golang.org/x/net v0.57.0
 	google.golang.org/grpc v1.83.0

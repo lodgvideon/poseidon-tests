@@ -19,7 +19,17 @@ format — it is **not** a production result; see README's Caveats.
 
 ## poseidon-http-client
 
-### No usable TLS dialer for the HTTP/1.1 transport
+> **Status: both poseidon findings below were reported and fixed upstream.**
+> [#331](https://github.com/lodgvideon/poseidon-http-client/issues/331) (the
+> 16 KiB per-request allocation) and
+> [#334](https://github.com/lodgvideon/poseidon-http-client/issues/334) (the
+> missing H1 TLS dialer) are closed. The harness now builds against
+> post-fix `main`, and the "after" measurements are in
+> [the H1 section below](#the-http11-pooled-transport-allocated-16-kib-per-request-fixed).
+> The descriptions are kept in the past tense as a record of what was found and
+> how, not as a description of current behaviour.
+
+### No usable TLS dialer for the HTTP/1.1 transport (fixed)
 
 `TransportH1Pool` and `TransportH1SingleConn` document their requirement
 clearly:
@@ -50,11 +60,23 @@ plausible-looking allocation and CPU numbers — 568 allocs/req and 74
 millicores, which would have gone straight into the comparison table as a
 catastrophic poseidon result had the error counts not been checked.
 
-Worth reporting upstream: either export an `H1TLSDialer`, or have
-`TLSDialer` respect an explicit `NextProtos` that excludes h2 instead of
-silently overriding it.
+**Fixed upstream** in
+[#334](https://github.com/lodgvideon/poseidon-http-client/issues/334) — and
+both suggested remedies were taken, not just one:
 
-### The HTTP/1.1 pooled transport allocates 16 KiB per request
+- `conn.H1TLSDialer` now exists, offering only `http/1.1` and asserting the
+  peer did not select anything else.
+- `conn.TLSDialer` no longer silently overrides an explicit `NextProtos`. A
+  config asking for `http/1.1` is now rejected **before dialing** with a typed
+  `ErrALPNConflict` naming the alternative, so the misconfiguration fails
+  loudly at construction instead of as a mangled exchange.
+- The H1 transport additionally asserts the connection it was handed really is
+  `http/1.1` (`assertH1Conn`), turning the old
+  `http1: read status line: EOF` into a message that names the protocol.
+
+This harness now uses the upstream dialer; the local workaround is gone.
+
+### The HTTP/1.1 pooled transport allocated 16 KiB per request (fixed)
 
 The HTTP/1.1 arm was the one regime where poseidon lost consistently. Profiling
 localised it to a single line — `client/h1_pool_transport.go:40`:
@@ -84,7 +106,7 @@ Pooling the scratch buffer (`sync.Pool`, or hanging it off the pooled
 `http1.Conn`, which already outlives individual exchanges) would remove it.
 
 Measured impact against `net/http` on identical work, generator overhead
-excluded, 200 RPS over a 40s plateau:
+excluded, 200 RPS over a 40s plateau (local, pre-fix):
 
 | Metric | poseidon | net/http | Δ |
 |---|---:|---:|---:|
@@ -92,10 +114,33 @@ excluded, 200 RPS over a 40s plateau:
 | bytes/request | 26,276 | 14,080 | **+87%** |
 | CPU (millicores) | 9.4 | 2.0 | **+368%** |
 
-The allocation *count* is nearly competitive; the byte volume and the CPU cost
-of collecting it are not. This is the clearest actionable result the benchmark
-produced, and it is specific to the H1 transport — H2, H3, and gRPC do not
-show it.
+The allocation *count* was nearly competitive; the byte volume and the CPU cost
+of collecting it were not. It was specific to the H1 transport — H2, H3, and
+gRPC never showed it.
+
+#### After the fix
+
+`h1Exchange` is now pointer-sized; the scratch buffer moved off the
+per-request exchange. Re-measured in-cluster at 200 RPS over a 60s plateau,
+same harness, same target, only the client version changed:
+
+| Metric | before | after | change |
+|---|---:|---:|---:|
+| allocs/request | 63.6 | 37.7 | **−40.6%** |
+| bytes/request | 27,481 | 2,317 | **−91.6%** |
+| CPU (millicores) | 109.9 | 100.3 | −8.8% |
+
+The 16 KiB array was essentially the *whole* byte volume of the H1 path —
+removing it cut allocated bytes by more than 11×. And the row flipped: against
+`net/http` on that same run, poseidon now allocates **32% fewer objects** and
+**85% fewer bytes**, where before it lost on both.
+
+**CPU did not follow, and that is the interesting part.** Poseidon's H1 arm is
+still ~12% *above* `net/http` on CPU despite allocating 85% fewer bytes, so
+whatever dominates H1 CPU is not allocation or GC pressure. That is now the
+open question for this transport; nothing in this benchmark localises it, and
+a CPU profile (`driver -profile-dir` writes heap profiles only — `/debug/pprof/
+profile` would be the entry point) is the obvious next step.
 
 ### The gRPC client sends a bare `application/grpc` content-type
 

@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/tls"
 	"fmt"
-	"net"
 	"sync"
 
 	pclient "github.com/lodgvideon/poseidon-http-client/client"
@@ -67,44 +66,22 @@ func tlsConfig(cfg Config, protos ...string) *tls.Config {
 	}
 }
 
-// h1TLSDialer dials TLS offering ONLY http/1.1 in ALPN.
-//
-// This exists because poseidon ships no dialer usable for HTTPS + HTTP/1.1.
-// TransportH1Pool's own documentation says the dialer "must NOT assert ALPN
-// h2 — use a plain TCP dialer or a TLS dialer with NextProtos containing only
-// http/1.1", but no such dialer is exported: conn.TLSDialer *prepends* "h2" to
-// whatever NextProtos you give it and then fails the dial unless the server
-// picks h2; conn.FlexDialer offers both and lets the server prefer h2; and
-// conn.PlaintextDialer does no TLS at all.
-//
-// Passing conn.TLSDialer here is silently wrong rather than loudly wrong: the
-// server negotiates h2, poseidon's H1 transport writes an HTTP/1.1 request
-// into it, and the connection dies with "read status line: EOF" while the
-// server logs a bogus-greeting error. That failure mode cost a debugging pass
-// and is the reason this type is spelled out rather than inlined.
-type h1TLSDialer struct{ cfg *tls.Config }
-
-func (d *h1TLSDialer) Dial(ctx context.Context, addr string) (net.Conn, error) {
-	td := &tls.Dialer{Config: d.cfg}
-	c, err := td.DialContext(ctx, "tcp", addr)
-	if err != nil {
-		return nil, err
-	}
-	tc, ok := c.(*tls.Conn)
-	if !ok {
-		_ = c.Close()
-		return nil, fmt.Errorf("h1TLSDialer: expected *tls.Conn, got %T", c)
-	}
-	// Assert the negotiation went the way the H1 leg requires, so a
-	// misconfiguration fails at dial rather than as a mangled exchange.
-	if p := tc.ConnectionState().NegotiatedProtocol; p != "" && p != "http/1.1" {
-		_ = tc.Close()
-		return nil, fmt.Errorf("h1TLSDialer: server negotiated %q, want http/1.1", p)
-	}
-	return tc, nil
-}
-
 func newPoseidonH1(cfg Config) (Client, error) {
+	// conn.H1TLSDialer offers only "http/1.1" in ALPN and rejects a config
+	// that asks for h2, rather than silently overriding it.
+	//
+	// It did not exist when this harness was written. conn.TLSDialer *prepended*
+	// "h2" to whatever NextProtos it was given and then required the server to
+	// pick h2, so the H1 leg silently ran over an h2-negotiated connection and
+	// failed 100% of requests while still producing plausible-looking numbers.
+	// That was reported as lodgvideon/poseidon-http-client#334 and fixed; this
+	// arm now uses the upstream dialer instead of a local workaround.
+	//
+	// NextProtos is left unset: H1TLSDialer fills in ["http/1.1"] itself, and
+	// passing it explicitly only risks tripping its ErrALPNConflict guard.
+	tc := tlsConfig(cfg)
+	tc.NextProtos = nil
+
 	// TransportH1Pool is an exclusive-checkout pool: HTTP/1.1 carries one
 	// exchange per connection, so MaxConnsPerHost IS the request concurrency.
 	c, err := pclient.NewClient(pclient.ClientOptions{
@@ -114,7 +91,7 @@ func newPoseidonH1(cfg Config) (Client, error) {
 			MaxConnsPerHost: cfg.Conns,
 		},
 		ConnOpts: pconn.ConnOptions{
-			Dialer: &h1TLSDialer{cfg: tlsConfig(cfg, "http/1.1")},
+			Dialer: &pconn.H1TLSDialer{Config: tc},
 		},
 	})
 	if err != nil {
