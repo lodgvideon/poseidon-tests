@@ -8,7 +8,6 @@ import (
 	"net"
 	"net/http"
 
-	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
 	"golang.org/x/net/http2"
 	"google.golang.org/grpc"
@@ -108,11 +107,12 @@ func newStdH2(cfg Config) (Client, error) {
 }
 
 func newQuicGoH3(cfg Config) (Client, error) {
+	// No stream-limit knob is set here. quic-go's MaxIncomingStreams bounds
+	// PEER-initiated streams (quic-go v0.61.0 interface.go:152), not the
+	// requests this client originates, so setting it to mirror poseidon's
+	// MaxStreamsPerConn was a no-op dressed up as a matched limit.
 	tr := &http3.Transport{
-		TLSClientConfig: tlsConfig(cfg),
-		QUICConfig: &quic.Config{
-			MaxIncomingStreams: int64(cfg.MaxStreamsPerConn),
-		},
+		TLSClientConfig:    tlsConfig(cfg),
 		DisableCompression: true,
 	}
 	return &stdHTTP{

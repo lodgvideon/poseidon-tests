@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import sys
+from datetime import datetime
 from pathlib import Path
 
 # ---------------------------------------------------------------------------
@@ -53,9 +54,40 @@ MIB = 1024.0 * 1024.0
 #: Deltas smaller than this (in absolute percent) are called a tie.
 EQUAL_BAND_PCT = 5.0
 
+#: Per-metric noise floors. A delta smaller than the metric's floor gets no
+#: verdict at all, because the measurement cannot distinguish it from noise.
+#:
+#: CPU is the reason this exists. At 200 RPS the driver runs at 7-8% of one
+#: core and only ~25% of its CPU samples are in the request path -- the rest is
+#: goroutine park/unpark and the harness's own rate limiter. A CPU delta below
+#: ~25% is not evidence of anything, and the previous flat 5% band stamped
+#: "poseidon better" on -14%/-18%/-19% CPU rows that a re-run in another
+#: environment flipped the sign of. Allocation counters are exact, accumulated
+#: by the runtime rather than sampled, so they keep the tighter band.
+#: See docs/FINDINGS.md, "The CPU column has poor signal at 200 RPS".
+NOISE_FLOOR_PCT = {
+    "CPU (millicores)": 25.0,
+    "RSS avg (MiB)": 10.0,
+    "RSS peak (MiB)": 10.0,
+}
+
+#: Verdict text for a delta inside the metric's noise floor.
+BELOW_FLOOR = "below noise floor"
+
+#: Wall-clock minus monotonic duration beyond this fraction means the measuring
+#: host lost time mid-window (a paused or clock-stepped VM), so any rate-derived
+#: figure from that cell -- CPU above all -- is suspect.
+CLOCK_DRIFT_PCT = 1.0
+
 #: Arms whose request counts or achieved RPS differ by more than this percent
 #: are not comparable on a per-request basis.
 PAIR_TOLERANCE_PCT = 2.0
+
+#: Arms whose consumed response body volume differs by more than this percent
+#: did not do the same work. Tighter than PAIR_TOLERANCE_PCT because the
+#: payload sequence is deterministic and shared, so any divergence at all is a
+#: harness bug rather than variance.
+BODY_TOLERANCE_PCT = 0.5
 
 DEFAULT_DIR = "results"
 OUTPUT_NAME = "COMPARISON.md"
@@ -92,6 +124,27 @@ def fmt_count(value):
 
 def to_mib(value):
     return None if value is None else value / MIB
+
+
+def wall_seconds(start_iso, end_iso):
+    """Seconds between two RFC 3339 snapshot timestamps, or None."""
+    if not isinstance(start_iso, str) or not isinstance(end_iso, str):
+        return None
+    try:
+        start = datetime.fromisoformat(start_iso)
+        end = datetime.fromisoformat(end_iso)
+    except ValueError:
+        return None
+    return (end - start).total_seconds()
+
+
+def plateau_seconds(record):
+    """The monotonic plateau duration the report's rates were divided by."""
+    requests = number(record, "plateau_requests")
+    rps = number(record, "achieved_rps")
+    if requests is None or rps is None or rps <= 0:
+        return None
+    return requests / rps
 
 
 def relative_gap_pct(a, b):
@@ -190,7 +243,7 @@ def load_reports(directory):
 # ---------------------------------------------------------------------------
 
 
-def delta_and_verdict(poseidon_value, standard_value):
+def delta_and_verdict(poseidon_value, standard_value, heading=""):
     """Return ``(delta_text, verdict_text)`` for one lower-is-better pair."""
     if poseidon_value is None or standard_value is None:
         return MISSING, MISSING
@@ -200,8 +253,12 @@ def delta_and_verdict(poseidon_value, standard_value):
 
     delta = (poseidon_value - standard_value) / standard_value * 100.0
     text = "{:+.1f}%".format(delta)
+    floor = NOISE_FLOOR_PCT.get(heading, EQUAL_BAND_PCT)
     if abs(delta) < EQUAL_BAND_PCT:
         verdict = "~equal"
+    elif abs(delta) < floor:
+        # Larger than a tie but smaller than this metric can resolve.
+        verdict = BELOW_FLOOR
     elif delta < 0:
         verdict = "poseidon better"
     else:
@@ -219,7 +276,7 @@ def render_metric_table(heading, extract, fmt, runs):
     for regime, label in REGIMES:
         poseidon = extract(runs.get((regime, "poseidon")))
         standard = extract(runs.get((regime, "standard")))
-        delta, verdict = delta_and_verdict(poseidon, standard)
+        delta, verdict = delta_and_verdict(poseidon, standard, heading)
         lines.append(
             "| {} | {} | {} | {} | {} |".format(
                 label, fmt(poseidon), fmt(standard), delta, verdict
@@ -278,6 +335,86 @@ def validity_findings(runs, load_errors, extra_files, unreadable):
                 if isinstance(sample, str) and sample.strip():
                     message += " - sample: `{}`".format(sample.strip())
                 findings.append(message)
+
+    # Response body volume consumed per arm.
+    #
+    # This is the mechanical guard for the failure mode this project has hit
+    # repeatedly: the harness doing unequal work in the two arms while every
+    # request count matches. It would have caught both the
+    # buffered-vs-discarded body bug and the fixed-size fetch regression, each
+    # of which was invisible to request counts and found only because a number
+    # looked implausible.
+    for regime, label in REGIMES:
+        poseidon = runs.get((regime, "poseidon"))
+        standard = runs.get((regime, "standard"))
+        if poseidon is None or standard is None:
+            continue
+        p_body = number(poseidon, "plateau_body_bytes")
+        s_body = number(standard, "plateau_body_bytes")
+        if p_body is None or s_body is None:
+            continue
+        body_gap = relative_gap_pct(p_body, s_body)
+        if body_gap is not None and body_gap > BODY_TOLERANCE_PCT:
+            findings.append(
+                "{}: plateau response body volume differs by {:.2f}% "
+                "(poseidon {}, standard {} bytes) - the two arms did not "
+                "consume the same work, so per-request figures are not "
+                "comparable.".format(
+                    label, body_gap, fmt_count(p_body), fmt_count(s_body)
+                )
+            )
+
+    # Hosts that lost wall-clock time during a measured window.
+    #
+    # Every rate-derived figure divides by the monotonic plateau duration. If
+    # the wall clock advanced materially further than the monotonic clock, the
+    # measuring host was paused or clock-stepped mid-window, and CPU
+    # millicores from that cell are not trustworthy.
+    for regime, label in REGIMES:
+        for arm in ARMS:
+            record = runs.get((regime, arm))
+            if record is None:
+                continue
+            start = record.get("plateau_start_snapshot")
+            end = record.get("plateau_end_snapshot")
+            if not isinstance(start, dict) or not isinstance(end, dict):
+                continue
+            wall = wall_seconds(start.get("at"), end.get("at"))
+            declared = number(record, "cpu_busy_seconds")
+            monotonic = plateau_seconds(record)
+            if wall is None or monotonic is None or monotonic <= 0:
+                continue
+            drift = (wall - monotonic) / monotonic * 100.0
+            if drift > CLOCK_DRIFT_PCT:
+                findings.append(
+                    "{} / {}: wall clock advanced {:.1f}% further than the "
+                    "monotonic plateau ({:.2f}s vs {:.2f}s) - the measuring "
+                    "host lost time mid-window, so CPU figures for this cell "
+                    "are unreliable.".format(
+                        label, arm, drift, wall, monotonic
+                    )
+                )
+            _ = declared
+
+    # Achieved rate against the requested rate.
+    for regime, label in REGIMES:
+        for arm in ARMS:
+            record = runs.get((regime, arm))
+            if record is None:
+                continue
+            achieved = number(record, "achieved_rps")
+            profile = record.get("profile")
+            target = number(profile, "target_rps") if isinstance(profile, dict) else None
+            if achieved is None or target is None or target <= 0:
+                continue
+            off = abs(achieved - target) / target * 100.0
+            if off > PAIR_TOLERANCE_PCT:
+                findings.append(
+                    "{} / {}: achieved {:.1f} RPS against a target of {:.0f} "
+                    "({:+.1f}%) - the run did not deliver the intended load, "
+                    "so the figures describe a different rate than stated."
+                    .format(label, arm, achieved, target, achieved - target)
+                )
 
     # Arms that did unequal amounts of work, or ran at different rates.
     for regime, label in REGIMES:

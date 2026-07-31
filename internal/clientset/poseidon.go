@@ -136,65 +136,47 @@ func newPoseidonH3(cfg Config) (Client, error) {
 	return &poseidonHTTP{c: c, host: Addr(cfg.Host, cfg.H3Port)}, nil
 }
 
-// poseidonGRPC drives poseidon's gRPC client. It holds a fixed set of
-// connections and round-robins calls across them, matching how grpc-go's
-// ClientConn multiplexes — neither arm gets a connection-count advantage.
+// poseidonGRPC drives poseidon's gRPC client over ONE connection, multiplexing
+// concurrent Invokes across it — matching grpc-go's ClientConn, which is a
+// single multiplexed connection and has no pool to configure.
+//
+// An earlier version dialled cfg.Conns (8) connections and checked one out per
+// call, which serialised each connection to a single in-flight RPC. Its comment
+// claimed parity with grpc-go; `netstat` during a run showed 8 established
+// connections for this arm against grpc-go's 1, so the claim was written from
+// intent and never verified. That topology put 8× the per-connection state
+// (TLS, HPACK tables, framer buffers) into RSS — gRPC was the only regime where
+// poseidon lost RSS — and changed write-coalescing behaviour, confounding CPU.
+// Per-RPC allocation figures were unaffected, since both dominant sites are
+// per-request regardless of connection count.
+//
+// poseidon's ClientConn multiplexes as many concurrent streams as the peer's
+// SETTINGS_MAX_CONCURRENT_STREAMS allows, so the checkout was never needed.
 type poseidonGRPC struct {
-	conns []*pgrpc.ClientConn
-	next  chan int
+	cc *pgrpc.ClientConn
 }
 
 func newPoseidonGRPC(cfg Config) (Client, error) {
 	addr := Addr(cfg.Host, cfg.GRPCPort)
-	n := cfg.Conns
-	if n < 1 {
-		n = 1
+	cc, err := pgrpc.Dial(context.Background(), addr, pgrpc.Options{
+		Authority: addr,
+		Scheme:    "https",
+		Conn: pconn.ConnOptions{
+			Dialer: &pconn.TLSDialer{Config: tlsConfig(cfg, "h2")},
+		},
+	})
+	if err != nil {
+		return nil, fmt.Errorf("poseidon grpc dial: %w", err)
 	}
-	p := &poseidonGRPC{next: make(chan int, n)}
-	for i := 0; i < n; i++ {
-		cc, err := pgrpc.Dial(context.Background(), addr, pgrpc.Options{
-			Authority: addr,
-			Scheme:    "https",
-			Conn: pconn.ConnOptions{
-				Dialer: &pconn.TLSDialer{Config: tlsConfig(cfg, "h2")},
-			},
-		})
-		if err != nil {
-			for _, c := range p.conns {
-				_ = c.Close()
-			}
-			return nil, fmt.Errorf("poseidon grpc dial: %w", err)
-		}
-		p.conns = append(p.conns, cc)
-		p.next <- i
-	}
-	return p, nil
+	return &poseidonGRPC{cc: cc}, nil
 }
 
 func (p *poseidonGRPC) Do(ctx context.Context, call Call) (Result, error) {
-	// Take a connection slot, use it, hand it back. Bounded checkout keeps
-	// in-flight streams per connection comparable to the grpc-go arm.
-	var i int
-	select {
-	case i = <-p.next:
-	case <-ctx.Done():
-		return Result{}, ctx.Err()
-	}
-	defer func() { p.next <- i }()
-
-	resp, err := p.conns[i].Invoke(ctx, rawgrpc.FullMethodEcho, call.Body, nil)
+	resp, err := p.cc.Invoke(ctx, rawgrpc.FullMethodEcho, call.Body, nil)
 	if err != nil {
 		return Result{}, err
 	}
 	return Result{Status: 200, BodyLen: len(resp)}, nil
 }
 
-func (p *poseidonGRPC) Close() error {
-	var firstErr error
-	for _, c := range p.conns {
-		if err := c.Close(); err != nil && firstErr == nil {
-			firstErr = err
-		}
-	}
-	return firstErr
-}
+func (p *poseidonGRPC) Close() error { return p.cc.Close() }

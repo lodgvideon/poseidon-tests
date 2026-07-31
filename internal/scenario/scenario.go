@@ -87,6 +87,75 @@ func MixFor[T ~string](regime T) []Weight {
 	return DefaultMix
 }
 
+// PathPool holds precomputed request paths, including the query parameters that
+// make server-generated responses vary in size.
+//
+// This exists because the driver used to issue bare `/v1/fetch` and `/v1/stream`
+// paths, so the target fell back to its defaults and returned a byte-identical
+// response every time. Half the HTTP mix (fetch 40% + stream 10%) was therefore
+// downloading a constant-size body — precisely the fixed-size flattery CONTEXT.md
+// rejects by name, and biased toward whichever client reuses a response buffer
+// best. See docs/FINDINGS.md.
+//
+// Paths are precomputed rather than formatted per request for the same reason
+// payloads are: string formatting on the hot path would put harness allocations
+// back into the numbers being measured.
+type PathPool struct {
+	fetch  []string
+	stream []string
+	n      uint64
+}
+
+// NewPathPool builds size variants of each parameterised path. The sequences are
+// deterministic, so both arms of a regime request identical response sizes.
+func NewPathPool(size int) *PathPool {
+	if size <= 0 {
+		size = 1024
+	}
+	p := &PathPool{
+		fetch:  make([]string, size),
+		stream: make([]string, size),
+		n:      uint64(size),
+	}
+	for i := 0; i < size; i++ {
+		// 4..203 items spans roughly 0.9 KiB to 45 KiB of response.
+		items := 4 + i%200
+		p.fetch[i] = All[Fetch].Path + "?n=" + itoa(items) + "&seq=" + itoa(i)
+		// 2..17 chunks, so the flushed-chunk count varies too.
+		p.stream[i] = All[Stream].Path + "?chunks=" + itoa(2+i%16)
+	}
+	return p
+}
+
+// Path returns the request path for a scenario at a given sequence number.
+// Scenarios without parameters return their static path.
+func (p *PathPool) Path(k Kind, seq uint64) string {
+	switch k {
+	case Fetch:
+		return p.fetch[seq%p.n]
+	case Stream:
+		return p.stream[seq%p.n]
+	default:
+		return All[k].Path
+	}
+}
+
+// itoa avoids pulling strconv into a package that otherwise has no imports
+// beyond the standard rand; it runs only at pool construction.
+func itoa(n int) string {
+	if n == 0 {
+		return "0"
+	}
+	var b [20]byte
+	i := len(b)
+	for n > 0 {
+		i--
+		b[i] = byte('0' + n%10)
+		n /= 10
+	}
+	return string(b[i:])
+}
+
 // Mix picks scenarios according to their weights.
 type Mix struct {
 	weights []Weight

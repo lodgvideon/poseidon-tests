@@ -8,19 +8,19 @@ Source directory: `results/rehearsal`
 
 | Regime | poseidon | standard | Δ | verdict |
 | --- | ---: | ---: | ---: | --- |
-| HTTP/1.1 | 100.3 | 89.3 | +12.3% | standard better |
-| HTTP/2 | 89.4 | 104.4 | -14.3% | poseidon better |
-| HTTP/3 | 133.8 | 162.9 | -17.9% | poseidon better |
-| gRPC | 105.8 | 129.9 | -18.6% | poseidon better |
+| HTTP/1.1 | 100.3 | 89.3 | +12.3% | below noise floor |
+| HTTP/2 | 89.4 | 104.4 | -14.3% | below noise floor |
+| HTTP/3 | 133.8 | 162.9 | -17.9% | below noise floor |
+| gRPC | 105.8 | 129.9 | -18.6% | below noise floor |
 
 ## RSS avg (MiB)
 
 | Regime | poseidon | standard | Δ | verdict |
 | --- | ---: | ---: | ---: | --- |
 | HTTP/1.1 | 42.2 | 42.8 | -1.4% | ~equal |
-| HTTP/2 | 41.3 | 45.4 | -8.9% | poseidon better |
+| HTTP/2 | 41.3 | 45.4 | -8.9% | below noise floor |
 | HTTP/3 | 46.3 | 44.9 | +3.1% | ~equal |
-| gRPC | 46.3 | 44.0 | +5.3% | standard better |
+| gRPC | 46.3 | 44.0 | +5.3% | below noise floor |
 
 ## RSS peak (MiB)
 
@@ -29,7 +29,7 @@ Source directory: `results/rehearsal`
 | HTTP/1.1 | 44.5 | 42.9 | +3.8% | ~equal |
 | HTTP/2 | 44.1 | 45.5 | -3.2% | ~equal |
 | HTTP/3 | 46.9 | 45.3 | +3.7% | ~equal |
-| gRPC | 46.5 | 44.1 | +5.4% | standard better |
+| gRPC | 46.5 | 44.1 | +5.4% | below noise floor |
 
 ## Allocations per request
 
@@ -52,6 +52,14 @@ Source directory: `results/rehearsal`
 ## Validity
 
 - HTTP/2 / poseidon: 4 plateau error(s) - sample: `stream: client: stream reset by peer: 7`
+- HTTP/1.1 / poseidon: wall clock advanced 3.1% further than the monotonic plateau (61.87s vs 60.03s) - the measuring host lost time mid-window, so CPU figures for this cell are unreliable.
+- HTTP/1.1 / standard: wall clock advanced 1.3% further than the monotonic plateau (60.84s vs 60.04s) - the measuring host lost time mid-window, so CPU figures for this cell are unreliable.
+- HTTP/2 / poseidon: wall clock advanced 2.0% further than the monotonic plateau (61.22s vs 60.04s) - the measuring host lost time mid-window, so CPU figures for this cell are unreliable.
+- HTTP/2 / standard: wall clock advanced 4.6% further than the monotonic plateau (62.84s vs 60.06s) - the measuring host lost time mid-window, so CPU figures for this cell are unreliable.
+- HTTP/3 / poseidon: wall clock advanced 2.3% further than the monotonic plateau (61.44s vs 60.03s) - the measuring host lost time mid-window, so CPU figures for this cell are unreliable.
+- HTTP/3 / standard: wall clock advanced 3.6% further than the monotonic plateau (62.21s vs 60.05s) - the measuring host lost time mid-window, so CPU figures for this cell are unreliable.
+- gRPC / poseidon: wall clock advanced 5.2% further than the monotonic plateau (63.17s vs 60.04s) - the measuring host lost time mid-window, so CPU figures for this cell are unreliable.
+- gRPC / standard: wall clock advanced 2.3% further than the monotonic plateau (61.40s vs 60.05s) - the measuring host lost time mid-window, so CPU figures for this cell are unreliable.
 
 ## Raw
 

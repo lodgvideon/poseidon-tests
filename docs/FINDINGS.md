@@ -382,3 +382,124 @@ server resolve the codec by subtype.
   method they sent a nil body, and `json.Unmarshal(nil)` failed ~55% of gRPC
   calls. The gRPC regime now runs an echo-only mix — see `scenario.GRPCMix`
   and the comparability caveat recorded there.
+
+---
+
+## Round 2 — 5-Whys investigation, and an adversarial review of the harness
+
+A second pass investigated every gap left after #331/#334, using 5 Whys with each step
+required to rest on gathered evidence rather than inference, and separately asked an
+independent reviewer whether this benchmark can be trusted at all. Four more client
+defects were filed; the review found four problems in the harness itself, all now fixed.
+
+### Client defects found and filed
+
+**[#344] HTTP/2 `REFUSED_STREAM` — the client destroys its own completed stream.**
+This closes the open question recorded above, and corrects it: the earlier note blamed the
+GOAWAY handler and rested on a false premise — *no connection is retired at all*. A frame
+capture (`GODEBUG=http2debug=2`) shows the server writing `HEADERS` + 9 × `DATA` (the last
+with `END_STREAM`) and then **reading `RST_STREAM(REFUSED_STREAM)` from the client**.
+
+The default stream event buffer is 8 slots (`conn/options.go:128`); a `/v1/stream`
+response delivers 10 events (1 HEADERS + 9 DATA); `pushLocked` (`conn/stream.go:346-376`)
+answers a full channel by killing the stream rather than applying backpressure. Causal
+test: setting `StreamEventBuffer: 64` and changing nothing else gave 0 errors across two
+runs, against 3 and 4 on the immediately preceding controls.
+
+The trigger is many *small* flushed frames, not many bytes — 8 × 529 B fits inside the
+65535-byte window, so flow control, the only backpressure that exists, never engages. A
+DATA-frames-per-stream histogram shows 671 of 6,453 streams with exactly 9 frames: 10.4%,
+matching the scenario's 10% weight.
+
+Worse than a tuning issue: the synthesised reset reuses `REFUSED_STREAM`, which
+`client/retry.go:44-46` classifies as safe to replay on the grounds that "the server did
+not process the request". Here the server processed it and wrote the whole response — so
+poseidon's own `Retryer`, the library's recommended remedy for code 7, would silently
+re-execute a completed request.
+
+**[#345] QUIC allocates on every packet.** Four one-line sites — `nonce` and `full` crypto
+scratch escaping through `cipher.AEAD` / `cipher.Block` interface calls, and a reflective
+`sort.Slice` over a 1–2 element slice once per received packet — account for ~40% of H3's
+allocation count. Confirmed by `-gcflags='-m'` escape output and pprof line attribution;
+quic-go hoists the same buffers onto its structs and maintains ACK ranges with an ordered
+insert.
+
+**[#346] The gRPC `Stream` is per-call, defeating two reuse mechanisms that already
+exist.** `decoder.buf` and `sendBuf` both start from nil on every RPC because the `Stream`
+embedding them is heap-allocated per call. Measured against the module's own framing code:
+poseidon costs 2.25× the message size where grpc-go costs 1.06×. Presizing from the length
+prefix reaches exact parity; reusing via the already-written `Reset()` — which has **zero
+non-test callers** module-wide — reaches 424 B/msg.
+
+**[#347] H3 duplicates the whole request body to prepend a ≤9-byte DATA frame header**,
+and copies every ~1157-byte chunk unpooled for retransmission. This also corrected a
+mis-attribution in #342: `AppendData` is a *request-body* copy, not one of the
+receive-path copies.
+
+### The harness was wrong in four ways — all found by review, all fixed here
+
+1. **Half the HTTP mix downloaded a byte-identical body.** The driver issued bare
+   `/v1/fetch` and `/v1/stream` paths, so the target fell back to its defaults and
+   returned the same response every time. fetch (40%) + stream (10%) = 50% of the mix had
+   *zero* response-size variation — precisely the fixed-size flattery CONTEXT.md rejects
+   by name, and biased toward whichever client reuses a response buffer best. Fixed:
+   `scenario.PathPool` precomputes parameterised paths (4–203 items, 2–17 chunks), keeping
+   the request path allocation-free.
+
+2. **The two gRPC arms ran different connection topologies.** poseidon dialled 8
+   connections and serialised one RPC on each; grpc-go used 1 multiplexed connection —
+   confirmed by `netstat` during a run, and the exact opposite of what the code comment
+   claimed. The comment was written from intent and never verified. That put 8× the
+   per-connection state (TLS, HPACK tables, framer buffers) into RSS — the only row
+   poseidon lost — and changed write-coalescing, confounding CPU. Per-RPC allocation
+   figures were unaffected. Fixed: one connection, concurrent `Invoke`s.
+
+3. **The CPU column stamped verdicts it cannot support.** `report.py` applied a single 5%
+   band to every metric, labelling −14/−18/−19% CPU rows "poseidon better" — four times
+   below the noise floor established earlier in this document, and at least one of them
+   flips sign when re-run in another environment. Fixed: per-metric noise floors
+   (CPU 25%, RSS 10%); those rows now read **"below noise floor"**.
+
+4. **The measuring host was losing wall-clock time, invisibly.** In every cell the
+   wall-clock plateau exceeded the monotonic duration the rates divide by — by 1.3% to
+   5.2%, and *by different amounts in the two arms of the same regime*. That is a paused
+   or clock-stepped VM under the kind cluster. Fixed: `report.py` now compares wall
+   against monotonic duration and flags any cell over 1%. It fires on all eight cells of
+   the committed rehearsal.
+
+Also fixed: response body volume is now reported per arm and cross-checked between them,
+flagging any divergence over 0.5%. That is the mechanical guard for the failure mode this
+project has now hit four times — the harness doing unequal work while request counts match
+— and it would have caught both the buffered-vs-discarded body bug and problem 1 above.
+Achieved rate is checked against target rate. The start heap profile is written before the
+plateau snapshot rather than inside the measured window. A misleading `MaxIncomingStreams`
+comment on the H3 standard arm was removed: it bounds peer-initiated streams and was a
+no-op.
+
+### What the reviewer concluded
+
+**Trustworthy with caveats, 6/10.** The allocation columns — what the benchmark exists to
+produce — were independently reproduced within 1–4% on a different OS, machine, run length
+and worker count, so the large deltas are robust and the defects they point at are real
+client findings rather than harness artifacts. The CPU column was not trustworthy and is
+now labelled accordingly.
+
+Verified sound, recorded so the audit is symmetric: H1/H2/H3 connection topology is fair;
+counter scoping is correct; `/proc/self/stat` parsing is correct; payload determinism and
+the shared pool hold; the marker-line report extraction and validity section are real
+safeguards; non-2xx counts match across arms, confirming mix equality in practice; and the
+target is not a bottleneck at 200 RPS.
+
+### Still open
+
+The reviewer's own questions, which this round raised but did not answer:
+
+- Does the H3 allocation-count gap reproduce in-cluster at the magnitude seen locally?
+  (+59% local vs +5.3% in-cluster; the per-request packet rate driving it was never
+  measured in-cluster.)
+- What are the true CPU deltas — or can this design measure CPU at 200 RPS at all?
+- Does the gRPC RSS gap survive now that both arms use one connection?
+- How much do the byte and allocation columns move now that fetch and stream sizes
+  actually vary?
+- How much of the flagship H1/H2 byte win is transport efficiency versus API idiom
+  (a reused caller-owned `Response` against a per-request `io.ReadAll`)?

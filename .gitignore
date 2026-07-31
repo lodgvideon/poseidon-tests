@@ -9,8 +9,12 @@ bin/
 
 # pprof output from `driver -profile-dir`.
 prof/
+prof*/
 *.pprof
 *.prof
+
+# Agent/session scratch that lands in the repo root.
+.claude/
 
 # Run output. scripts/run.sh defaults to OUTDIR=results, so a local matrix run
 # lands directly in results/ — that is someone's machine's numbers, not the

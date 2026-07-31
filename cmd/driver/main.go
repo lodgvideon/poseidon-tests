@@ -51,6 +51,7 @@ type counters struct {
 	plateauStartTotal  atomic.Uint64
 	plateauStartErrs   atomic.Uint64
 	plateauStartNon2xx atomic.Uint64
+	plateauStartBody   atomic.Uint64
 
 	// firstErr keeps one example failure so a run that silently degrades
 	// into all-errors is diagnosable from the report alone.
@@ -75,6 +76,11 @@ type Report struct {
 	AchievedRPS     float64 `json:"achieved_rps"`
 	// SampleError is one example transport failure, empty on a clean run.
 	SampleError string `json:"sample_error,omitempty"`
+	// PlateauBodyBytes is the total response body volume consumed during the
+	// plateau. Comparing it between the two arms is the mechanical guard that
+	// they did equal work — the check that would have caught both the
+	// buffered-vs-discarded body bug and the fixed-size fetch regression.
+	PlateauBodyBytes uint64 `json:"plateau_body_bytes"`
 
 	CPUBusySeconds float64 `json:"cpu_busy_seconds"`
 	CPUGCSeconds   float64 `json:"cpu_gc_seconds"`
@@ -159,6 +165,9 @@ func main() {
 	if err != nil {
 		log.Fatalf("driver: build payload pool: %v", err)
 	}
+	// Paths carry the query parameters that make server-generated responses
+	// vary in size; without them half the mix downloads a constant body.
+	paths := scenario.NewPathPool(*poolSize)
 
 	ticker := load.NewTicker(profile)
 	defer ticker.Stop()
@@ -174,7 +183,7 @@ func main() {
 	for i := 0; i < *workers; i++ {
 		go func(id int) {
 			defer wg.Done()
-			runWorker(ctx, id, *seed, pool, regime, client, ticker, &cs)
+			runWorker(ctx, id, *seed, pool, paths, regime, client, ticker, &cs)
 		}(i)
 	}
 
@@ -182,13 +191,19 @@ func main() {
 	// instant the ramp ends, and again when the run finishes. Everything the
 	// comparison table reports is the difference between these two points.
 	plateauStart := waitUntil(ctx, ticker.PlateauStart())
+	// Written before startSnap: writeProfile forces a GC and serialises a heap
+	// profile, and doing that after the snapshot charges both to the measured
+	// window — visible on a low-allocating arm whose whole plateau is ~18 MB.
+	if plateauStart {
+		writeProfile(*profileDir, string(regime), string(arm), "start")
+	}
 	startSnap := selfmetrics.Read()
 	cs.plateauStartTotal.Store(cs.total.Load())
 	cs.plateauStartErrs.Store(cs.errs.Load())
 	cs.plateauStartNon2xx.Store(cs.non2xx.Load())
+	cs.plateauStartBody.Store(cs.bodyByte.Load())
 	if plateauStart {
 		log.Printf("driver: plateau reached — measurement window open")
-		writeProfile(*profileDir, string(regime), string(arm), "start")
 	}
 
 	wg.Wait()
@@ -203,7 +218,7 @@ func main() {
 // generator and scenario mix, both seeded from (seed, worker id), so the
 // sequence is deterministic and reproducible across arms without any
 // cross-worker synchronisation.
-func runWorker(ctx context.Context, id int, seed uint64, pool *payload.Pool, regime clientset.Regime, c clientset.Client, t *load.Ticker, cs *counters) {
+func runWorker(ctx context.Context, id int, seed uint64, pool *payload.Pool, paths *scenario.PathPool, regime clientset.Regime, c clientset.Client, t *load.Ticker, cs *counters) {
 	mix := scenario.NewMix(seed, id, scenario.MixFor(regime))
 	var seq uint64
 
@@ -214,7 +229,7 @@ func runWorker(ctx context.Context, id int, seed uint64, pool *payload.Pool, reg
 		call := clientset.Call{
 			Scenario: sc.Name,
 			Method:   sc.Method,
-			Path:     sc.Path,
+			Path:     paths.Path(sc.Kind, seq),
 		}
 		if sc.HasBody {
 			call.Body = pool.For(id, seq)
@@ -304,6 +319,7 @@ func buildReport(
 	rep.PlateauRequests = reqs
 	rep.PlateauErrors = cs.errs.Load() - cs.plateauStartErrs.Load()
 	rep.PlateauNon2xx = cs.non2xx.Load() - cs.plateauStartNon2xx.Load()
+	rep.PlateauBodyBytes = cs.bodyByte.Load() - cs.plateauStartBody.Load()
 	if s, ok := cs.firstErr.Load().(string); ok {
 		rep.SampleError = s
 	}
