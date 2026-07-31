@@ -142,6 +142,107 @@ open question for this transport; nothing in this benchmark localises it, and
 a CPU profile (`driver -profile-dir` writes heap profiles only — `/debug/pprof/
 profile` would be the entry point) is the obvious next step.
 
+### gRPC allocates ~24 KiB per RPC recycling a stream — the same shape as #331
+
+The gRPC row loses on bytes/request by **+170%** (78,680 vs 29,177 against
+grpc-go). Profiling attributes 63% of the arm's allocated bytes to two sites,
+both per-request:
+
+```
+  171.66MB 33.55%  grpc.(*decoder).Push        framing.go:66   d.buf = append(d.buf, chunk...)
+  153.52MB 30.01%  conn.recycleStream          stream.go:243   s.events = make(chan StreamEvent, cap(s.events))
+```
+
+**`recycleStream` allocates a fresh channel every time it recycles a stream** —
+in the path whose entire purpose is to avoid allocation. The size is not
+incidental. For a gRPC connection, `eventBufferFor(DefaultMaxMessageSize,
+maxFrameSize)` computes `(4 MiB + 256 KiB) / 16384 = 272` slots, and
+`StreamEvent` is 88 bytes, so each channel is **~24 KiB**. At ~6,400 requests
+that is 153 MB — matching the profile exactly.
+
+This is the same defect class as
+[#331](https://github.com/lodgvideon/poseidon-http-client/issues/331): a large
+per-request allocation sitting in a reuse path. It is *bigger* than the 16 KiB
+H1 one it followed.
+
+Two things compound it, and they have different fixes:
+
+1. **The recycle allocates at all.** The code comments explain why — a stale
+   reference from the previous stream lifetime could otherwise write into the
+   recycled stream's channel. That is a real correctness concern, so "just
+   reuse the buffer" is not obviously safe; a generation counter on the stream
+   would let stale writers detect a dead generation without re-minting.
+2. **The channel is sized off `MaxRecvMessageSize`,** which defaults to 4 MiB
+   whatever the caller's actual messages look like. Setting it to something
+   near the real message size shrinks the channel dramatically — 256 KiB gives
+   32 slots (~2.8 KiB), roughly 8× smaller. That is a caller-side knob
+   available today, and this harness deliberately does not set it, because it
+   measures default configuration.
+
+`decoder.Push` is the second site: `d.buf` grows by `append` per chunk, ~27 KiB
+per request, suggesting the decode buffer is not carried across calls.
+
+### HTTP/3 copies the response body through three growing buffers
+
+The H3 row loses on bytes/request by **+105%** (43,282 vs 21,123 against
+quic-go). Three sites account for 56% of the arm's bytes, and they are the same
+operation at three different layers:
+
+```
+   72.12MB 23.29%  quic.(*recvStream).insert     stream.go:385  r.data = append(r.data, data[have-offset:]...)
+   58.99MB 19.05%  http3.(*FrameReader).Feed     stream.go:55   r.buf = append(r.buf, b...)
+   41.26MB 13.32%  http3.AppendData              frame.go:59    return append(dst, data...)
+```
+
+Response bytes are copied into a growing buffer at QUIC stream reassembly,
+again into the HTTP/3 frame reader, and again when the frame payload is
+appended out. Each `append` carries reallocation-on-growth cost, so a 15 KiB
+body costs several times its own size before it reaches the caller.
+
+For contrast, the quic-go arm's profile shows almost nothing on its receive
+path — its largest entry is `io.ReadAll` at 77 MB, which is *this harness*
+materialising the body, not the library. The gap is a layering cost, not a
+tuning one, and closing it means passing buffers down rather than copying at
+each boundary.
+
+### The CPU column has poor signal at 200 RPS — including the H1 residual
+
+After #331 was fixed, HTTP/1.1 still measured **+12% CPU** against `net/http`
+despite allocating 85% fewer bytes. That looked like a real unexplained cost.
+It is mostly measurement floor.
+
+A 15-second CPU profile taken mid-plateau on each arm:
+
+| | poseidon | net/http |
+|---|---:|---:|
+| total samples in 15s | 1.11s (7.4% of a core) | 1.22s (8.1% of a core) |
+| `runtime.semawakeup` | 36.9% | 28.7% |
+| in the request path (`runWorker` cum) | ~25% | ~25% |
+| **this harness's own rate limiter** (`load.Ticker.run`) | — | 19.7% |
+
+Three things follow:
+
+- **Only about a quarter of CPU samples are in the request path at all.** The
+  rest is goroutine park/unpark (`semawakeup`), the Go scheduler, and the
+  harness's rate limiter, which wakes a goroutine per request to pace 200 RPS.
+- **The sign does not even reproduce.** Locally poseidon consumed *less* total
+  CPU than `net/http` (1.11s vs 1.22s) — the opposite of the in-cluster +12%.
+- At 7–8% of one core, a ±12% difference in total process CPU is not
+  distinguishable from scheduling noise.
+
+**How to read the comparison table, then:** the allocation columns are exact
+counters accumulated by the runtime, and they are trustworthy — a −85% or
++170% there is real. The CPU column is a sampled rate over a lightly-loaded
+process, and **differences below roughly 20% should not be treated as
+meaningful at this load.** The large CPU deltas (H2/H3/gRPC, −14% to −19%,
+consistently signed across runs) are more likely real than the small H1 one,
+but none of them are as solid as the allocation figures.
+
+This is a limitation of the load model, not a bug: ADR-0002 fixes the rate at
+200 RPS deliberately, and the price of a light, realistic load is that CPU
+differences stay near the floor. Raising the rate would sharpen CPU at the cost
+of answering a different question.
+
 ### The gRPC client sends a bare `application/grpc` content-type
 
 `grpc/conn.go` hardcodes `content-type: application/grpc`, with no way to set a
