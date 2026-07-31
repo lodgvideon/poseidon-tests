@@ -144,6 +144,8 @@ profile` would be the entry point) is the obvious next step.
 
 ### gRPC allocates ~24 KiB per RPC recycling a stream — the same shape as #331
 
+> Reported as [#341](https://github.com/lodgvideon/poseidon-http-client/issues/341).
+
 The gRPC row loses on bytes/request by **+170%** (78,680 vs 29,177 against
 grpc-go). Profiling attributes 63% of the arm's allocated bytes to two sites,
 both per-request:
@@ -184,6 +186,8 @@ per request, suggesting the decode buffer is not carried across calls.
 
 ### HTTP/3 copies the response body through three growing buffers
 
+> Reported as [#342](https://github.com/lodgvideon/poseidon-http-client/issues/342).
+
 The H3 row loses on bytes/request by **+105%** (43,282 vs 21,123 against
 quic-go). Three sites account for 56% of the arm's bytes, and they are the same
 operation at three different layers:
@@ -206,6 +210,11 @@ tuning one, and closing it means passing buffers down rather than copying at
 each boundary.
 
 ### The CPU column has poor signal at 200 RPS — including the H1 residual
+
+> A correction was posted to
+> [#331](https://github.com/lodgvideon/poseidon-http-client/issues/331) withdrawing
+> the "unexplained H1 CPU cost" this supersedes — it was this harness's
+> instrument, not the client.
 
 After #331 was fixed, HTTP/1.1 still measured **+12% CPU** against `net/http`
 despite allocating 85% fewer bytes. That looked like a real unexplained cost.
