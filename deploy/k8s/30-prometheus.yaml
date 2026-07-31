@@ -1,0 +1,112 @@
+# Prometheus scrapes the driver pods for the continuous view of the run —
+# the ramp and plateau as a time series. The scored numbers still come from
+# the driver's own JSON report (a delta across exact plateau boundaries);
+# Prometheus is what makes the run legible in Grafana while it happens.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: prometheus-config
+  namespace: poseidon-bench
+data:
+  prometheus.yml: |
+    global:
+      scrape_interval: 5s
+      evaluation_interval: 15s
+
+    scrape_configs:
+      # Driver pods are discovered by label, and the regime/arm labels are
+      # carried onto every sample so Grafana can plot the two arms of a
+      # regime against each other without any manual series wiring.
+      - job_name: driver
+        kubernetes_sd_configs:
+          - role: pod
+            namespaces:
+              names: [poseidon-bench]
+        relabel_configs:
+          - source_labels: [__meta_kubernetes_pod_label_app]
+            action: keep
+            regex: driver
+          - source_labels: [__meta_kubernetes_pod_label_regime]
+            target_label: regime
+          - source_labels: [__meta_kubernetes_pod_label_arm]
+            target_label: arm
+          - source_labels: [__meta_kubernetes_pod_ip]
+            target_label: __address__
+            replacement: $1:9100
+          - source_labels: [__meta_kubernetes_pod_name]
+            target_label: pod
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: prometheus
+  namespace: poseidon-bench
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: poseidon-bench-prometheus
+rules:
+  - apiGroups: [""]
+    resources: [pods, services, endpoints, nodes]
+    verbs: [get, list, watch]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: poseidon-bench-prometheus
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: ClusterRole
+  name: poseidon-bench-prometheus
+subjects:
+  - kind: ServiceAccount
+    name: prometheus
+    namespace: poseidon-bench
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: prometheus
+  namespace: poseidon-bench
+  labels: { app: prometheus }
+spec:
+  replicas: 1
+  selector:
+    matchLabels: { app: prometheus }
+  template:
+    metadata:
+      labels: { app: prometheus }
+    spec:
+      serviceAccountName: prometheus
+      containers:
+        - name: prometheus
+          image: prom/prometheus:v3.1.0
+          args:
+            - --config.file=/etc/prometheus/prometheus.yml
+            - --storage.tsdb.path=/prometheus
+            # A full matrix is ~3.5h; 24h retention covers a run plus review.
+            - --storage.tsdb.retention.time=24h
+          ports:
+            - { name: web, containerPort: 9090 }
+          volumeMounts:
+            - { name: config, mountPath: /etc/prometheus }
+            - { name: data, mountPath: /prometheus }
+          resources:
+            requests: { cpu: "200m", memory: "512Mi" }
+            limits: { cpu: "1", memory: "2Gi" }
+      volumes:
+        - name: config
+          configMap: { name: prometheus-config }
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: prometheus
+  namespace: poseidon-bench
+spec:
+  selector: { app: prometheus }
+  ports:
+    - { name: web, port: 9090, targetPort: 9090 }

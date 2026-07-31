@@ -1,0 +1,59 @@
+# Template for one measured run. `scripts/run.sh` substitutes the ${...}
+# placeholders and applies the result — one Job per (regime, arm) cell.
+#
+# A Job rather than a Deployment because a run is a finite piece of work with
+# a report at the end: the pod must terminate so the orchestrator knows the
+# window closed and can collect the JSON from the logs.
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: driver-${REGIME}-${ARM}
+  namespace: poseidon-bench
+  labels:
+    app: driver
+    regime: "${REGIME}"
+    arm: "${ARM}"
+spec:
+  backoffLimit: 0 # a failed run must not silently retry into the results
+  completions: 1
+  parallelism: 1
+  template:
+    metadata:
+      labels:
+        app: driver
+        regime: "${REGIME}"
+        arm: "${ARM}"
+    spec:
+      restartPolicy: Never
+      containers:
+        - name: driver
+          image: poseidon-tests:local
+          imagePullPolicy: Never
+          command: ["/driver"]
+          args:
+            - "-regime=${REGIME}"
+            - "-arm=${ARM}"
+            - "-host=target.poseidon-bench.svc.cluster.local"
+            - "-tls-port=8443"
+            - "-h3-port=8444"
+            - "-grpc-port=9443"
+            - "-rps=${RPS}"
+            - "-ramp=${RAMP}"
+            - "-plateau=${PLATEAU}"
+            - "-workers=${WORKERS}"
+            - "-conns=${CONNS}"
+            - "-seed=${SEED}"
+            - "-metrics-addr=:9100"
+          ports:
+            - { name: metrics, containerPort: 9100, protocol: TCP }
+          # Identical to the other arm's allocation, and generous enough that
+          # neither client is ever CPU-throttled — a throttled run would
+          # measure the cgroup, not the library.
+          resources:
+            requests: { cpu: "2", memory: "1Gi" }
+            limits: { cpu: "4", memory: "2Gi" }
+          env:
+            # Pinning GOMAXPROCS makes the CPU figure comparable across runs
+            # and independent of which node the pod lands on.
+            - name: GOMAXPROCS
+              value: "4"

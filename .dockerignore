@@ -1,0 +1,17 @@
+# The Dockerfile does `COPY . .`, so without this every build ships the whole
+# working tree as build context. Keep it to what the build actually needs:
+# go.mod, go.sum, cmd/ and internal/.
+.git/
+.gitignore
+bin/
+prof/
+results/
+deploy/
+docs/
+scripts/
+*.md
+*.exe
+*.pprof
+__pycache__/
+.idea/
+.vscode/
