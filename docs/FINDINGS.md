@@ -135,12 +135,14 @@ removing it cut allocated bytes by more than 11×. And the row flipped: against
 `net/http` on that same run, poseidon now allocates **32% fewer objects** and
 **85% fewer bytes**, where before it lost on both.
 
-**CPU did not follow, and that is the interesting part.** Poseidon's H1 arm is
-still ~12% *above* `net/http` on CPU despite allocating 85% fewer bytes, so
-whatever dominates H1 CPU is not allocation or GC pressure. That is now the
-open question for this transport; nothing in this benchmark localises it, and
-a CPU profile (`driver -profile-dir` writes heap profiles only — `/debug/pprof/
-profile` would be the entry point) is the obvious next step.
+**CPU did not follow — but that turned out to be this harness, not the client.**
+The row still measured ~12% *above* `net/http` on CPU despite allocating 85%
+fewer bytes, which looked like a real unexplained cost and was reported as such
+on #331. A CPU profile showed it is measurement floor: at 200 RPS the driver
+runs at 7–8% of one core and only ~25% of samples are in the request path at
+all. See [the CPU-column section below](#the-cpu-column-has-poor-signal-at-200-rps--including-the-h1-residual)
+for the numbers, and #331 for the retraction. There is no unexplained H1 CPU
+cost to chase.
 
 ### gRPC allocates ~24 KiB per RPC recycling a stream — the same shape as #331
 
