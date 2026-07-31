@@ -36,13 +36,33 @@ const (
 	// ArmStandard is the incumbent a consumer would otherwise use:
 	// net/http for H1/H2, quic-go/http3 for H3, grpc-go for gRPC.
 	ArmStandard Arm = "standard"
+	// ArmStandardPooled is a DIAGNOSTIC arm, deliberately outside the scored
+	// matrix. It is byte-for-byte the standard arm except that the response
+	// body is materialised into a sync.Pool'd bytes.Buffer instead of a fresh
+	// io.ReadAll buffer per request.
+	//
+	// It exists to split the flagship H1/H2 bytes-per-request win into the part
+	// that is transport efficiency and the part that is body-materialisation
+	// idiom: poseidon's caller-owned reusable Response against net/http's
+	// per-request io.ReadAll. Running it answers "what would a consumer who
+	// already pools buffers around net/http actually gain?".
+	//
+	// It is NOT in Arms and NOT in report.py's ARMS, so the committed 4x2
+	// matrix and the comparison table are unaffected.
+	ArmStandardPooled Arm = "standard-pooled"
 )
 
-// Regimes and Arms enumerate the full 4x2 matrix.
+// Regimes and Arms enumerate the full 4x2 matrix. ArmStandardPooled is
+// deliberately absent: it is a diagnostic, not a scored cell.
 var (
 	Regimes = []Regime{RegimeH1, RegimeH2, RegimeH3, RegimeGRPC}
 	Arms    = []Arm{ArmPoseidon, ArmStandard}
 )
+
+// parseableArms is what ParseArm accepts — the scored matrix plus the
+// diagnostic arm, which an operator can select explicitly but which no matrix
+// enumeration will ever produce on its own.
+var parseableArms = []Arm{ArmPoseidon, ArmStandard, ArmStandardPooled}
 
 // Call is one request to issue. It is protocol-agnostic: each implementation
 // maps it onto its own wire representation.
@@ -113,6 +133,10 @@ func New(regime Regime, arm Arm, cfg Config) (Client, error) {
 		return newPoseidonGRPC(cfg)
 	case regime == RegimeGRPC && arm == ArmStandard:
 		return newGRPCGo(cfg)
+	case regime == RegimeH1 && arm == ArmStandardPooled:
+		return newStdH1Pooled(cfg)
+	case regime == RegimeH2 && arm == ArmStandardPooled:
+		return newStdH2Pooled(cfg)
 	}
 	return nil, fmt.Errorf("clientset: no implementation for regime=%q arm=%q", regime, arm)
 }
@@ -129,10 +153,10 @@ func ParseRegime(s string) (Regime, error) {
 
 // ParseArm validates an arm name.
 func ParseArm(s string) (Arm, error) {
-	for _, a := range Arms {
+	for _, a := range parseableArms {
 		if string(a) == strings.ToLower(s) {
 			return a, nil
 		}
 	}
-	return "", fmt.Errorf("clientset: unknown arm %q (want poseidon or standard)", s)
+	return "", fmt.Errorf("clientset: unknown arm %q (want poseidon, standard, or standard-pooled)", s)
 }

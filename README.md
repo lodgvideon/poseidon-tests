@@ -133,6 +133,26 @@ admin access since the cluster is throwaway.
 poseidon, standard, Δ%, and a verdict. **Lower is better everywhere**, so a
 negative Δ means poseidon won.
 
+### Two things to know before quoting the bytes/request row
+
+**Most of it is API idiom, not the wire path.** The standard arm calls
+`io.ReadAll`, allocating a fresh growth-doubling buffer per response; the
+poseidon arm appends into a pooled, caller-owned `Response`. Both are idiomatic
+for their library, but a `net/http` consumer who already pools read buffers
+sees far less benefit:
+
+| | vs `net/http` | vs `net/http` **with a pooled read buffer** |
+|---|---:|---:|
+| H1 bytes/req | −90.2% | **−63%** |
+| H2 bytes/req | −94.2% | **−84%** |
+
+Measure it yourself with the diagnostic arm: `-arm standard-pooled` (H1/H2
+only; deliberately outside the scored matrix).
+
+**The allocation-count row is not affected by this** — 67–82% of that win
+survives the pooled control, because it comes from `net/http`'s per-request
+object graph rather than from body buffering. See `docs/FINDINGS.md`.
+
 Read the **Validity** section first. It flags anything that makes the numbers
 untrustworthy — nonzero errors, the two arms doing materially different request
 counts, or achieved rates diverging. A cell with errors is not a result.

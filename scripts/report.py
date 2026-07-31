@@ -57,16 +57,19 @@ EQUAL_BAND_PCT = 5.0
 #: Per-metric noise floors. A delta smaller than the metric's floor gets no
 #: verdict at all, because the measurement cannot distinguish it from noise.
 #:
-#: CPU is the reason this exists. At 200 RPS the driver runs at 7-8% of one
-#: core and only ~25% of its CPU samples are in the request path -- the rest is
-#: goroutine park/unpark and the harness's own rate limiter. A CPU delta below
-#: ~25% is not evidence of anything, and the previous flat 5% band stamped
+#: CPU is the reason this exists. The floor was later MEASURED rather than
+#: guessed, by running one arm against itself repeatedly: 13.4% coefficient of
+#: variation at 200 RPS, giving a ~30% minimum resolvable delta between two
+#: single runs. The cause is quantisation, not composition -- a tick-sampled OS
+#: counter accumulates only ~100 ticks over a plateau in which the process runs
+#: at 5-8% of one core. A CPU delta below that floor is not evidence of
+#: anything, and the original flat 5% band stamped
 #: "poseidon better" on -14%/-18%/-19% CPU rows that a re-run in another
 #: environment flipped the sign of. Allocation counters are exact, accumulated
 #: by the runtime rather than sampled, so they keep the tighter band.
 #: See docs/FINDINGS.md, "The CPU column has poor signal at 200 RPS".
 NOISE_FLOOR_PCT = {
-    "CPU (millicores)": 25.0,
+    "CPU (millicores)": 30.0,
     "RSS avg (MiB)": 10.0,
     "RSS peak (MiB)": 10.0,
 }
@@ -254,7 +257,12 @@ def delta_and_verdict(poseidon_value, standard_value, heading=""):
     delta = (poseidon_value - standard_value) / standard_value * 100.0
     text = "{:+.1f}%".format(delta)
     floor = NOISE_FLOOR_PCT.get(heading, EQUAL_BAND_PCT)
-    if abs(delta) < EQUAL_BAND_PCT:
+    if abs(delta) < floor and floor > EQUAL_BAND_PCT:
+        # Do not claim a tie on a metric that cannot resolve one: "~equal" is a
+        # positive claim of equality, and below the floor the instrument
+        # supports neither that nor a winner.
+        verdict = BELOW_FLOOR
+    elif abs(delta) < EQUAL_BAND_PCT:
         verdict = "~equal"
     elif abs(delta) < floor:
         # Larger than a tie but smaller than this metric can resolve.

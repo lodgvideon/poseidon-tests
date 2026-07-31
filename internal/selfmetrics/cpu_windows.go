@@ -21,6 +21,13 @@ func processCPUSeconds() (float64, bool) {
 	if err := syscall.GetProcessTimes(h, &creation, &exit, &kernel, &user); err != nil {
 		return 0, false
 	}
-	// Filetime counts 100-nanosecond intervals; Nanoseconds() converts.
-	return float64(kernel.Nanoseconds()+user.Nanoseconds()) / 1e9, true
+	// Kernel and user FILETIMEs are DURATIONS, not timestamps. Filetime.Nanoseconds()
+	// subtracts the 1601->1970 epoch offset, which is correct for a wall-clock
+	// FILETIME and badly wrong here — it made absolute CPUBusySeconds a large
+	// negative number. Deltas still came out right, which is why the plateau
+	// figures were unaffected and the bug survived, but the absolute field was
+	// nonsense. Combine the raw 100-nanosecond tick counts instead.
+	ticks := uint64(kernel.HighDateTime)<<32 | uint64(kernel.LowDateTime)
+	ticks += uint64(user.HighDateTime)<<32 | uint64(user.LowDateTime)
+	return float64(ticks) / 1e7, true
 }

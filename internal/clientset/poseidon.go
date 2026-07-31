@@ -119,13 +119,27 @@ func newPoseidonH2(cfg Config) (Client, error) {
 }
 
 func newPoseidonH3(cfg Config) (Client, error) {
+	// ONE QUIC connection, to match quic-go's http3.Transport, which has
+	// exactly one connection per host by construction.
+	//
+	// This is the third instance of the same confound: an H3 pool sized to
+	// cfg.Conns (8) was being compared against an architecturally-single
+	// connection, exactly as the gRPC arm was before it was corrected, and as
+	// the H1 arm would have been had its pool not happened to match. A
+	// multi-connection arm pays per-connection state (crypto, ACK trackers,
+	// congestion control) that the single-connection arm does not, which lands
+	// in both the count and RSS columns.
+	//
+	// QUIC multiplexes streams within a connection, so one connection carries
+	// the offered concurrency without serialising anything.
+	//
 	// The H3 transports own their own QUIC dialing, so they take TLSConfig
 	// directly rather than a ConnOpts.Dialer.
 	c, err := pclient.NewClient(pclient.ClientOptions{
 		Addr:      Addr(cfg.Host, cfg.H3Port),
 		Transport: pclient.TransportH3Pool,
 		Pool: &pclient.PoolOptions{
-			MaxConnsPerHost:   cfg.Conns,
+			MaxConnsPerHost:   1,
 			MaxStreamsPerConn: cfg.MaxStreamsPerConn,
 		},
 		TLSConfig: tlsConfig(cfg),

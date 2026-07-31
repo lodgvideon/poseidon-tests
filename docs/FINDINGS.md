@@ -503,3 +503,112 @@ The reviewer's own questions, which this round raised but did not answer:
   actually vary?
 - How much of the flagship H1/H2 byte win is transport efficiency versus API idiom
   (a reused caller-owned `Response` against a per-request `io.ReadAll`)?
+
+---
+
+## Round 3 — the headline was overstated, and the H3 number was measured on the wrong OS
+
+Two corrections, both material, and both to claims this document previously made.
+
+### Most of the flagship byte win is API idiom, not the wire path
+
+The headline "poseidon allocates 90% fewer bytes on H1, 94% on H2" bundles two independent
+effects. A third **diagnostic arm** (`standard-pooled`: byte-for-byte the standard arm
+except the response body is materialised into a `sync.Pool`'d buffer instead of a fresh
+`io.ReadAll` buffer) separates them:
+
+| | poseidon vs `net/http` | poseidon vs `net/http` **with a pooled read buffer** |
+|---|---:|---:|
+| H1 bytes/req | −90.2% | **−63%** |
+| H2 bytes/req | −94.2% | **−84%** |
+
+So roughly **four fifths of the H1 delta and two thirds of the H2 delta is response-body
+buffer reuse** — something any `net/http` consumer can do today without changing client
+libraries. Body volume across the three arms agreed to 0.005–0.238%, 0 errors in all 12
+cells, and the local headline reproduced the in-cluster one (H1 −89.9% local vs −90.2%
+in-cluster), so the split carries over.
+
+The honest transport claim is the smaller one: *against a `net/http` arm that already pools
+its read buffer, poseidon still allocates 63% (H1) and 84% (H2) fewer bytes* — mostly by
+not paying `x/net/http2`'s per-stream `dataChunkPool` refill (~5.2 KB/req, H2) or
+`net/http`'s 32 KiB request-write copy buffer (~2.2 KB/req, H1).
+
+**This correction does not extend to the allocation-count column.** 67–82% of the count
+win survives the pooled control (H1 poseidon 39.0 vs pooled 53.3 vs standard 59.9; H2 11.3
+vs 42.5 vs 49.5), because `io.ReadAll`'s cost is byte-volume-dominated while the object
+count is dominated by `net/http`'s per-request object graph — `Request`, parsed and cloned
+`URL`, two header maps, the cancel-context chain, `Response` — which pooling a buffer does
+nothing about. The **−35.8% / −77.9% allocation-count headline stands** as a genuine
+library difference.
+
+The diagnostic arm is committed but deliberately **outside the scored matrix**
+(`clientset.ArmStandardPooled`, selectable with `-arm standard-pooled`, absent from `Arms`
+and from `report.py`), so the 4×2 comparison is unchanged.
+
+### The H3 allocation gap was quoted from the wrong operating system
+
+#345 was filed citing a +59% allocation-count gap measured on Windows loopback. The gap in
+the environment this benchmark reports is **+8.9%**. Measured on byte-identical work
+across three environments:
+
+| Environment | poseidon | quic-go | gap | QUIC packets/req |
+|---|---:|---:|---:|---:|
+| Windows loopback | 243.4 | 145.2 | +67.6% | 37.8 |
+| Linux, same-pod loopback (MTU 65536) | 159.0 | 145.1 | +9.6% | 16.0 |
+| Linux, pod-to-pod veth (MTU 1500) | 159.4 | 146.4 | +8.9% | 16.6 |
+
+MTU and loopback are both ruled out — a 44× MTU change moves the number by 4%; the OS
+moves it by 7×. The cause is that poseidon emits ~2.9× more, smaller QUIC packets on
+Windows for the same stream bytes (423 B vs 962 B average chunk), and #345's per-packet
+cost is multiplied by that rate. The mechanism is confirmed and quantitatively closed:
+(243.4 − 159.4) allocs ÷ (37.8 − 16.6) packets = **3.96 objects per packet**, matching
+#345's site list, corroborated by OS packet counters. quic-go's allocs/req moves 0.9%
+across the same three environments, so the coupling is poseidon's.
+
+*Why* poseidon fragments its sends on Windows was **not** established — loss, MTU,
+flow-control blocking, stream contention and GSO batching were each ruled out by evidence;
+what remains are timing-coupled clamps in `Stream.grantable`, which would need cwnd
+instrumentation inside the client to separate. The chain was stopped rather than guessed.
+
+#345 has been corrected upstream with the Linux figure. Its size is better stated as a
+share of poseidon's *own* H3 count (~37% for the four named sites, ~75% including all
+packet-driven sites), which is environment-robust, than as a ratio against quic-go, which
+is not. A **new** Linux-only site was found in the process — the GRO receive path
+allocating ~6 objects per `recvmsg`, ~20% of the in-cluster H3 count, invisible to Windows
+profiling — filed as **#348**.
+
+This also invalidates a claim made earlier in this document: that cross-environment
+*ratios* are the meaningful part while absolute figures are not. That holds for H1/H2,
+where per-request cost dominates. It is false for H3 by a factor of 7, because there the
+cost is per-*packet* and the packet rate is set by the operating system.
+
+### Harness fixes this round
+
+- **H3 connection topology matched.** The poseidon H3 arm pooled 8 QUIC connections
+  against quic-go's architecturally-single one — the **third** instance of the topology
+  confound that already forced one retraction (gRPC). Now 1 connection both sides. The
+  earlier claim in this document that H3 topology was "verified sound" was wrong.
+- **The CPU noise floor was measured, not guessed:** running one arm against itself gives
+  a 13.4% coefficient of variation at 200 RPS, so the minimum resolvable delta between two
+  single runs is ~30%. The floor in `report.py` was raised from 25% to 30%. The cause is
+  quantisation, not composition — a tick-sampled counter accumulates only ~100 ticks over
+  a plateau where the process runs at 5–8% of one core. Raising RPS collapses the variance
+  by making the measured quantity larger; it barely changes the request path's *share*.
+- **A sub-floor delta is no longer labelled "~equal."** Calling a difference a tie is a
+  positive claim of equality, and below the floor the instrument supports neither that nor
+  a winner. Such rows now read "below noise floor" too.
+- **`cpu_windows.go` was computing a nonsense absolute value.** `Filetime.Nanoseconds()`
+  subtracts the 1601→1970 epoch offset, which is right for a wall-clock FILETIME and wrong
+  for a duration, making absolute `CPUBusySeconds` a large negative number. Deltas were
+  unaffected, which is why it survived. Now computed from raw 100 ns ticks.
+
+### Still open
+
+- Does the H3 allocation verdict survive matched topology **in-cluster**? The fix is in;
+  the causal test (−3.0% allocs at `-conns 1`) was local Windows only.
+- Two CPU instruments the harness already records (`cpu_busy_seconds` from the OS,
+  `cpu_runtime_seconds` from `runtime/metrics`) disagree by 1.15–1.54×, and the
+  disagreement correlates with the arm rather than cancelling — enough to flip the H1
+  sign. Which is right is undetermined.
+- The three-way byte decomposition should be reproduced in-cluster before the restated
+  headline is treated as final.
