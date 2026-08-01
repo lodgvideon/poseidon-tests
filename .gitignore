@@ -25,6 +25,8 @@ prof*/
 # silently keep ignoring it.
 /results/*
 !/results/replicated/
+# Per-invocation partial tables inside replicate dirs; only the aggregate counts.
+/results/replicated/rep*/COMPARISON.md
 
 # Editor / OS noise
 .idea/
