@@ -68,7 +68,7 @@ real cost for a consumer regardless of which HTTP client they pick, and hiding
 them behind a fixed-size payload would make the comparison too favorable to
 whichever client happens to cache better at one specific size.
 
-Payloads are **precomputed** into a per-worker pool of 1024 and cycled, rather
+Payloads are **precomputed** into a pool of 1024 shared by all workers and cycled, rather
 than generated per request. Generating them inline turned out to cost ~60% of
 every allocation the benchmark measured, burying the signal it exists to
 capture (see `docs/FINDINGS.md`). Size and content still vary from request to

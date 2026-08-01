@@ -22,26 +22,35 @@ const userHZ = 100.0
 // over a short window — they are only refreshed during a GC cycle. See the
 // package-level note in cpu_fallback.go and TestCPUAdvancesUnderLoad.
 func processCPUSeconds() (float64, bool) {
+	u, s, ok := processCPUSplit()
+	return u + s, ok
+}
+
+// processCPUSplit returns utime and stime separately. The split matters
+// because the runtime-metrics view of CPU is P-occupancy accounting and has
+// no notion of kernel time at all, so any systematic gap between the two
+// instruments has to be checked against stime before it is explained away.
+func processCPUSplit() (user, sys float64, ok bool) {
 	b, err := os.ReadFile("/proc/self/stat")
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
 	// Field 2 (comm) is parenthesised and may itself contain spaces, so scan
 	// from the closing paren rather than splitting the whole record.
 	i := bytes.LastIndexByte(b, ')')
 	if i < 0 || i+2 >= len(b) {
-		return 0, false
+		return 0, 0, false
 	}
 	fields := strings.Fields(string(b[i+2:]))
 	// utime and stime are fields 14 and 15 of the full record, i.e. indices
 	// 11 and 12 once comm and state have been consumed.
 	if len(fields) < 13 {
-		return 0, false
+		return 0, 0, false
 	}
 	utime, err1 := strconv.ParseUint(fields[11], 10, 64)
 	stime, err2 := strconv.ParseUint(fields[12], 10, 64)
 	if err1 != nil || err2 != nil {
-		return 0, false
+		return 0, 0, false
 	}
-	return float64(utime+stime) / userHZ, true
+	return float64(utime) / userHZ, float64(stime) / userHZ, true
 }

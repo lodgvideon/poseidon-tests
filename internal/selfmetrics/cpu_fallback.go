@@ -17,3 +17,6 @@ package selfmetrics
 // the CPU column with suspicion and cross-check against `cpu_runtime_seconds`
 // in the report. TestCPUAdvancesUnderLoad will fail here by design.
 func processCPUSeconds() (float64, bool) { return 0, false }
+
+// processCPUSplit likewise has no source here.
+func processCPUSplit() (user, sys float64, ok bool) { return 0, 0, false }

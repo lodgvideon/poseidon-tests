@@ -25,6 +25,7 @@ prof*/
 # silently keep ignoring the sample.
 /results/*
 !/results/rehearsal/
+!/results/cpu-replicates/
 
 # Editor / OS noise
 .idea/

@@ -57,19 +57,36 @@ EQUAL_BAND_PCT = 5.0
 #: Per-metric noise floors. A delta smaller than the metric's floor gets no
 #: verdict at all, because the measurement cannot distinguish it from noise.
 #:
-#: CPU is the reason this exists. The floor was later MEASURED rather than
-#: guessed, by running one arm against itself repeatedly: 13.4% coefficient of
-#: variation at 200 RPS, giving a ~30% minimum resolvable delta between two
-#: single runs. The cause is quantisation, not composition -- a tick-sampled OS
-#: counter accumulates only ~100 ticks over a plateau in which the process runs
-#: at 5-8% of one core. A CPU delta below that floor is not evidence of
-#: anything, and the original flat 5% band stamped
-#: "poseidon better" on -14%/-18%/-19% CPU rows that a re-run in another
-#: environment flipped the sign of. Allocation counters are exact, accumulated
-#: by the runtime rather than sampled, so they keep the tighter band.
-#: See docs/FINDINGS.md, "The CPU column has poor signal at 200 RPS".
+#: CPU is the reason this exists, and the number has been revised twice.
+#:
+#: The first floor (25%) was guessed. The second (30%) came from a measured
+#: 13.4% run-to-run coefficient of variation, explained at the time as
+#: quantisation of a tick-sampled counter over a lightly-loaded process.
+#:
+#: THAT EXPLANATION WAS WRONG. The variance was dominated by a second CPU field
+#: the harness also recorded, `cpu_runtime_seconds`, whose delta does not span
+#: the plateau at all: Go refreshes /cpu/classes/* only at GC mark termination,
+#: so the window is [last GC before start, last GC before end]. On a
+#: low-allocating arm that window collapses -- 24.4s of a 45s plateau in one
+#: measured case, and 0% on an 8s plateau -- which inflates the apparent
+#: variance and, worse, does so in an arm-correlated way, because GC frequency
+#: tracks allocation rate. Replicate CV: 32.3% on a 1-2-GC arm against 4.1% on
+#: an 18-GC arm, from the same instrument on the same comparison.
+#:
+#: Measured properly, on the OS instrument alone (/proc/self/stat, validated
+#: against cgroup v2 cpu.stat read by a separate supervising process, agreeing
+#: to within 2% with no arm dependence), per-arm replicate CV is 4.1-4.6%
+#: locally and **0.9% in-cluster** (three replicates per arm, H1, alternating
+#: arms). The implied minimum resolvable delta is ~2%, not 30%.
+#:
+#: The floor below is set to 10% anyway -- an order of magnitude above the
+#: measured CV -- to absorb host variability between non-adjacent cells, which
+#: the clock-drift check shows is real. It is deliberately conservative, but it
+#: must not be so conservative that it hides findings: the 30% floor suppressed
+#: a genuine, replicated +15.9% H1 result and caused a true claim to be
+#: retracted upstream. See docs/FINDINGS.md, Round 4.
 NOISE_FLOOR_PCT = {
-    "CPU (millicores)": 30.0,
+    "CPU (millicores)": 10.0,
     "RSS avg (MiB)": 10.0,
     "RSS peak (MiB)": 10.0,
 }
@@ -403,6 +420,42 @@ def validity_findings(runs, load_errors, extra_files, unreadable):
                     )
                 )
             _ = declared
+
+    # Cells whose runtime-sourced CPU fields did not span the plateau.
+    #
+    # cpu_runtime_seconds / cpu_gc_seconds / cpu_user_seconds come from Go's
+    # /cpu/classes/*, which the runtime refreshes only at GC mark termination.
+    # The window they describe therefore runs from the last GC before the
+    # plateau opened to the last GC before it closed, and on a low-allocating
+    # arm that can be half the plateau or none of it. Measured in-container at
+    # 200 RPS: H1 poseidon covered 24.4s of a 47.7s window (1 GC), H1 standard
+    # covered 46.4s (18 GCs) - which alone flips the sign of the comparison,
+    # from +16% (OS and cgroup) to -35% (runtime).
+    #
+    # The scored CPU column uses cpu_busy_seconds, which is OS-sourced and
+    # immune to this. The check exists so that anyone reaching for the runtime
+    # fields is told which cells cannot support them.
+    for regime, label in REGIMES:
+        for arm in ARMS:
+            record = runs.get((regime, arm))
+            if record is None:
+                continue
+            if record.get("cpu_runtime_valid") is not False:
+                continue
+            window = number(record, "cpu_runtime_window_seconds")
+            monotonic = plateau_seconds(record)
+            cycles = number(record, "gc_cycles")
+            findings.append(
+                "{} / {}: runtime-sourced CPU fields cover {} of a {} plateau "
+                "({} GC cycles) - cpu_runtime_seconds, cpu_gc_seconds and "
+                "cpu_user_seconds are not comparable for this cell. The scored "
+                "CPU column (cpu_busy_seconds) is unaffected.".format(
+                    label, arm,
+                    "{:.1f}s".format(window) if window is not None else "?",
+                    "{:.1f}s".format(monotonic) if monotonic is not None else "?",
+                    int(cycles) if cycles is not None else "?",
+                )
+            )
 
     # Achieved rate against the requested rate.
     for regime, label in REGIMES:

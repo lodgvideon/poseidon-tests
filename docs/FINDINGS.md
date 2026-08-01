@@ -532,7 +532,7 @@ cells, and the local headline reproduced the in-cluster one (H1 −89.9% local v
 in-cluster), so the split carries over.
 
 The honest transport claim is the smaller one: *against a `net/http` arm that already pools
-its read buffer, poseidon still allocates 63% (H1) and 84% (H2) fewer bytes* — mostly by
+its read buffer, poseidon still allocates 60.3% (H1) and 82.9% (H2) fewer bytes* — mostly by
 not paying `x/net/http2`'s per-stream `dataChunkPool` refill (~5.2 KB/req, H2) or
 `net/http`'s 32 KiB request-write copy buffer (~2.2 KB/req, H1).
 
@@ -541,7 +541,7 @@ the pooled control — in-cluster, poseidon is still **−27.3%** (H1) and **−
 against the pooled arm (H1 38.6 vs 53.1 vs 60.1; H2 11.2 vs 42.8 vs 49.4) — because `io.ReadAll`'s cost is byte-volume-dominated while the object
 count is dominated by `net/http`'s per-request object graph — `Request`, parsed and cloned
 `URL`, two header maps, the cancel-context chain, `Response` — which pooling a buffer does
-nothing about. The **−35.8% / −77.9% allocation-count headline stands** as a genuine
+nothing about. The **−35.8% / −77.4% allocation-count headline stands** as a genuine
 library difference.
 
 The diagnostic arm is committed but deliberately **outside the scored matrix**
@@ -622,5 +622,71 @@ real cell against the same target under the same load.
   `cpu_runtime_seconds` from `runtime/metrics`) disagree by 1.15–1.54×, and the
   disagreement correlates with the arm rather than cancelling — enough to flip the H1
   sign. Which is right is undetermined.
-- The three-way byte decomposition should be reproduced in-cluster before the restated
-  headline is treated as final.
+
+
+---
+
+## Round 4 — the retraction was wrong, and the floor was hiding a real result
+
+### The H1 CPU cost is real; I retracted a true claim
+
+Round 3 established which of the two CPU fields the driver records is trustworthy, using
+external ground truth. The answer changed a published conclusion.
+
+`cpu_runtime_seconds` (Go `runtime/metrics`, `/cpu/classes/total` − `/cpu/classes/idle`) is
+**not safe to difference over a measurement window.** Go refreshes those metrics only at GC
+mark termination (`runtime/mgc.go`, the sole `cpuStats.accumulate` call; `metrics.go`'s
+`compute()` merely copies, with a TODO saying it deliberately does not refresh). So the
+delta spans *[last GC before start, last GC before end]*, not the plateau. Measured: 24.4 s
+of a 45 s plateau on a low-allocating arm; 0% of an 8 s plateau. The error is bounded by
+the GC interval, and **the GC interval tracks allocation rate** — the one thing this
+benchmark is built to make differ between arms. Replicate CV from that instrument: **32.3%
+on a 1–2-GC arm against 4.1% on an 18-GC arm**, same comparison, same load.
+
+`cpu_busy_seconds` (`/proc/self/stat`) is correct. Validated against cgroup v2 `cpu.stat`
+read by a *separate supervising process* — a different kernel subsystem, nanosecond
+scheduler runtime rather than tick sampling — agreeing to within 1.5–2.0% across nine
+cells, **with no arm dependence** (0.980–0.985, not sorted by arm).
+
+The consequence: the 30% CPU noise floor was derived from variance the contaminated
+instrument produced, then applied to the clean one. Re-measured in-cluster with three
+replicates per arm, arms alternated so host drift hits both:
+
+| arm | millicores | CV |
+|---|---|---|
+| poseidon | 117.3, 115.3, 116.1 | **0.9%** |
+| `net/http` | 100.6, 99.3, 100.9 | **0.9%** |
+
+**+15.9%**, every poseidon run above every standard run, pairwise +14.2% to +18.1%. At
+0.9% per-arm CV the minimum resolvable delta is ~2%. The published floor was ~15× too
+conservative and was suppressing a replicated result.
+
+**So the H1 CPU finding retracted on #331 was true, and has been un-retracted.** After the
+#331 fix, poseidon's H1 arm allocates 32% fewer objects and 90% fewer bytes than `net/http`
+and still burns ~16% more CPU. Whatever dominates H1 CPU is not allocation or GC pressure.
+It is not localised — a profile at 200 RPS is dominated by scheduler wakeups.
+
+The floor is now **10%**: an order of magnitude above the measured CV, conservative enough
+to absorb host variability between non-adjacent cells, but not so conservative that it
+hides findings. That balance is the lesson — a floor is a claim about what the instrument
+cannot see, and setting it too high is as much an error as setting it too low.
+
+`cpu_gc_seconds` and `cpu_user_seconds` were also confirmed still frozen on low-allocating
+arms: the earlier "CPU column silently died" fix covered only `cpu_busy_seconds`. Both now
+have OS-backed sources. The report additionally carries `cpu_runtime_window_seconds`,
+`cpu_runtime_valid` and `gc_cycles`, and `report.py` raises a validity finding whenever the
+runtime window does not span the plateau — it fires on 2 of 3 poseidon replicates
+(gc_cycles = 2) and none of the standard ones (25), exactly the arm-correlation predicted.
+
+Raw replicate data is committed under `results/cpu-replicates/`.
+
+### Method note
+
+Three separate times now a *measurement* has been wrong in a way that favoured a
+conclusion: the payload generator inflating allocations, the per-worker pool inflating RSS,
+and now a noise floor suppressing a real CPU difference. The first two were caught because
+an absolute number moved more than the delta between arms. This one was caught only by
+validating one instrument against an *independent* one. The generalisable rule: **a floor,
+a tolerance, or a "below noise" verdict is a positive claim and needs the same evidence as
+a finding.** Deriving a threshold from one instrument and applying it to another is exactly
+the error that produced a false retraction here.

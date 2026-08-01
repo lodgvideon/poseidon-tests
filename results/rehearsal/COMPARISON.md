@@ -8,10 +8,10 @@ Source directory: `results/rehearsal`
 
 | Regime | poseidon | standard | Δ | verdict |
 | --- | ---: | ---: | ---: | --- |
-| HTTP/1.1 | 120.1 | 98.8 | +21.6% | below noise floor |
-| HTTP/2 | 105.9 | 117.9 | -10.2% | below noise floor |
+| HTTP/1.1 | 120.1 | 98.8 | +21.6% | standard better |
+| HTTP/2 | 105.9 | 117.9 | -10.2% | poseidon better |
 | HTTP/3 | 157.4 | 171.6 | -8.3% | below noise floor |
-| gRPC | 103.1 | 123.6 | -16.6% | below noise floor |
+| gRPC | 103.1 | 123.6 | -16.6% | poseidon better |
 
 ## RSS avg (MiB)
 

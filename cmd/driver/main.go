@@ -83,8 +83,24 @@ type Report struct {
 	PlateauBodyBytes uint64 `json:"plateau_body_bytes"`
 
 	CPUBusySeconds float64 `json:"cpu_busy_seconds"`
-	CPUGCSeconds   float64 `json:"cpu_gc_seconds"`
 	CPUMillicores  float64 `json:"cpu_millicores"`
+	// The OS split of CPUBusySeconds. Kernel time is the majority of this
+	// driver's CPU (60-69% measured in-container), which is the part the
+	// runtime's own CPU accounting cannot see.
+	CPUProcUserSeconds float64 `json:"cpu_proc_user_seconds"`
+	CPUProcSysSeconds  float64 `json:"cpu_proc_sys_seconds"`
+
+	// Runtime-sourced CPU. Only meaningful when CPURuntimeValid is true: the
+	// /cpu/classes/* metrics are refreshed at GC mark termination and nowhere
+	// else, so on a low-allocating arm the window they describe can be half
+	// the plateau or none of it. CPURuntimeWindowSec is that window's real
+	// length, against PlateauSec. Do NOT compare CPUGCSeconds between arms
+	// without checking CPURuntimeValid on both.
+	CPURuntimeSeconds   float64 `json:"cpu_runtime_seconds"`
+	CPUGCSeconds        float64 `json:"cpu_gc_seconds"`
+	CPURuntimeWindowSec float64 `json:"cpu_runtime_window_seconds"`
+	CPURuntimeValid     bool    `json:"cpu_runtime_valid"`
+	GCCycles            uint64  `json:"gc_cycles"`
 
 	AllocBytesTotal   uint64  `json:"alloc_bytes_total"`
 	AllocObjectsTotal uint64  `json:"alloc_objects_total"`
@@ -324,7 +340,13 @@ func buildReport(
 		rep.SampleError = s
 	}
 	rep.CPUBusySeconds = d.CPUBusySeconds
+	rep.CPUProcUserSeconds = d.CPUProcUserSeconds
+	rep.CPUProcSysSeconds = d.CPUProcSysSeconds
+	rep.CPURuntimeSeconds = d.CPURuntimeSeconds
 	rep.CPUGCSeconds = d.CPUGCSeconds
+	rep.CPURuntimeWindowSec = d.RuntimeWindow.Seconds()
+	rep.CPURuntimeValid = d.RuntimeCPUUsable()
+	rep.GCCycles = d.GCCycles
 	rep.AllocBytesTotal = d.AllocBytes
 	rep.AllocObjectsTotal = d.AllocObjects
 	rep.Start = start
@@ -375,6 +397,15 @@ func emit(rep Report, outPath string) {
 	// thing written and cannot be followed by interleaved output.
 	log.Printf("driver: done — %d requests in plateau, %.1f rps, %.1f allocs/req, %.0f millicores",
 		rep.PlateauRequests, rep.AchievedRPS, rep.AllocsPerReq, rep.CPUMillicores)
+	if !rep.CPURuntimeValid {
+		// Loud, because the failure is silent and arm-correlated: it is the
+		// low-allocating arm — the one winning — whose runtime CPU figures go
+		// stale, and a delta of exactly zero looks like a real measurement.
+		log.Printf("driver: WARNING runtime CPU fields unusable — %d GC cycles in the plateau, "+
+			"so /cpu/classes/* covers %.1fs of a %.1fs window; cpu_runtime_seconds, "+
+			"cpu_gc_seconds and cpu_user_seconds are NOT comparable for this cell",
+			rep.GCCycles, rep.CPURuntimeWindowSec, rep.Profile.PlateauSec)
+	}
 	fmt.Println(ReportMarker + string(compact))
 }
 
