@@ -12,10 +12,10 @@ same runs as anything under `results/`. Absolute figures — especially CPU
 millicores — are not comparable across those two environments; the poseidon
 vs. standard *ratios* within a single run are the meaningful part.
 
-The in-cluster comparison table is produced by `scripts/run.sh` and lands in
-`results/COMPARISON.md`. `results/rehearsal/` holds a short (15s ramp / 60s
-plateau) full-matrix rehearsal, committed as a worked example of the output
-format — it is **not** a production result; see README's Caveats.
+The committed dataset is `results/replicated/` — three replicates per cell,
+arms alternated, 15s ramp / 60s plateau, produced by `scripts/run.sh` and
+aggregated by `scripts/report.py`. Replicated cells are scored by complete
+separation rather than against a noise floor; see Round 4 for why that matters.
 
 ## poseidon-http-client
 
@@ -690,3 +690,86 @@ validating one instrument against an *independent* one. The generalisable rule: 
 a tolerance, or a "below noise" verdict is a positive claim and needs the same evidence as
 a finding.** Deriving a threshold from one instrument and applying it to another is exactly
 the error that produced a false retraction here.
+
+---
+
+## Round 5 — the H1 CPU cost, localised
+
+Round 4 confirmed poseidon's HTTP/1.1 arm burns more CPU while allocating far less. Round 5
+found why, with causal tests. Two mechanisms, and both share a pattern: **poseidon's own
+HTTP/2 layer already solves them and documents why; the HTTP/1.1 layer never got the same
+treatment.** That is precisely why H2 is the regime poseidon wins on CPU and H1 the one it
+loses.
+
+### The gap is kernel time, not user time
+
+sys 4.70 s vs 3.67 s (**+28.1%**); user 2.18 s vs 2.42 s (**−9.9%**). Poseidon does *less*
+user-space work — consistent with allocating 36% fewer objects — and more than makes it back
+in syscalls and scheduling. Allocation instruments are structurally blind to this, which is
+why four rounds of allocation profiling never saw it.
+
+### [#355] A context watchdog armed on every I/O call
+
+`http1.Conn` arms a watchdog before every blocking call, via **two unbuffered channel
+rendezvous** — a full goroutine handoff each, which on a multi-P runtime is a futex wake.
+Its only early exit is `ctx.Done() == nil`, so any caller passing a cancellable context
+(i.e. every real caller) pays it on every call, **including the majority that never block**.
+
+Causal test, same binary, only the context type changed:
+
+| arm | cancellable ctx | `context.Background()` | Δ |
+|---|---:|---:|---:|
+| poseidon H1 | 113.9 mc | 86.0 mc | **−28.0** |
+| `net/http` | 101.9 mc | 101.4 mc | −0.5 |
+
+28.0 millicores against a total gap of 13.3. Syscall census confirms the mechanism:
+futex 28,458 vs 18,409 over ~2,243 requests = **+4.48 per request**, against ~4.5 arm sites
+per request, with write and ioctl counts unchanged.
+
+The H2 layer already applies the fix and names it (`conn/conn.go:1128`): "A
+context-cancellation watcher (`context.AfterFunc`) is registered only when we actually need
+to block … not on every call."
+
+Note the design intent: `ctxWatchdog` uses an atomic CAS rather than `sync.Once` explicitly
+because `Once.Do`'s closure would heap-allocate per arming. The allocation was removed; the
+cost was moved into the scheduler, where this benchmark's allocation columns cannot see it.
+
+### [#356] No write buffering, and `net.Buffers` inverts over TLS
+
+`http1.Conn` wraps only the **read** side. The request head is assembled as a `net.Buffers`
+and written with `bufs.WriteTo(ex.c.nc)` — but `net.Buffers.WriteTo` reaches `writev` only
+for `*net.TCPConn` (an unexported interface). Over TLS the writer is a `*tls.Conn`, so it
+degrades to a plain loop and **each header line becomes its own TLS record and syscall**.
+
+5.14 writes/request against `net/http`'s 1.37, for the same bytes. Coalescing below TLS
+removes 17.1 millicores. On cleartext the same client issues ~1 writev + ~1 write per
+request — **the optimisation works in the case nobody deploys and inverts in the case
+everybody does.**
+
+Again the H2 layer names the exact failure mode (`conn/conn.go:31-42`): "especially over
+TLS, where each Write becomes its own record + syscall … Wrapping the transport writer in a
+`bufio.Writer` lets the header and payload coalesce into one flush."
+
+The two costs overlap (each socket write is also a watchdog arming): 45.1 mc gross, 37.0 net.
+
+### The scored table is now replicated
+
+Every cell is three replicates with arms alternated, and `report.py` scores replicated cells
+by **complete separation** — a winner only when every replicate of one arm beats every
+replicate of the other. No distributional assumption, which is what makes it usable at n=3,
+and it replaces a floor that had to be guessed in advance and got it wrong twice.
+
+| Regime | allocs/req | bytes/req | CPU | RSS avg |
+|---|---|---|---|---|
+| HTTP/1.1 | **−36.3%** | **−90.3%** | +15.3% | **−1.8%** |
+| HTTP/2 | **−77.8%** | **−94.5%** | **−15.6%** | **−10.5%** |
+| HTTP/3 | +9.0% | +123.0% | **−14.5%** | +1.6% |
+| gRPC | **−64.7%** | +166.5% | **−20.9%** | **−2.3%** |
+
+CV 0.3–3.4%; every row separated, none overlapping. Two corrections fall out: H3's CPU is a
+poseidon **win** (−14.5%), not the "below noise floor" a single run reported at −8.3%; and
+H1's CPU loss settles at +15.3%, against the +21.6% a single run showed.
+
+The bytes/request row still carries the idiom caveat from Round 3 — against a `net/http` arm
+that pools its read buffer, poseidon's H1/H2 advantage is −60.3%/−82.9% rather than
+−90%/−94%. The allocation-count row does not.

@@ -119,12 +119,23 @@ plus `results/COMPARISON.md`.
 Smoke-test the whole pipeline on one regime in a couple of minutes first:
 
 ```bash
-REGIMES=h2 RAMP=15s PLATEAU=60s OUTDIR=results/rehearsal bash scripts/run.sh
+REGIMES=h2 RAMP=15s PLATEAU=60s OUTDIR=results/smoke bash scripts/run.sh
 ```
 
 Drop `REGIMES=h2` to rehearse all eight cells — about 12 minutes.
-`results/rehearsal/` in this repo is the committed output of exactly that
-full-matrix rehearsal.
+
+`results/replicated/` in this repo is the committed dataset: **three replicates
+per cell**, arms alternated within each replicate so host drift hits both. Write
+replicates to `rep1/`, `rep2/`, … under one output directory and `report.py`
+aggregates them automatically:
+
+```bash
+for i in 1 2 3; do
+  for regime in h1 h2 h3 grpc; do for arm in poseidon standard; do
+    REGIMES=$regime ARMS=$arm RAMP=15s PLATEAU=60s       OUTDIR=results/replicated/rep$i bash scripts/run.sh
+  done; done
+done
+```
 
 ### Watching a run
 
@@ -137,9 +148,32 @@ admin access since the cluster is throwaway.
 
 ## Reading the output
 
-`results/COMPARISON.md` has one table per metric, each row a regime, with
-poseidon, standard, Δ%, and a verdict. **Lower is better everywhere**, so a
-negative Δ means poseidon won.
+`COMPARISON.md` has one table per metric, each row a regime, with poseidon,
+standard, Δ%, and a verdict. **Lower is better everywhere**, so a negative Δ
+means poseidon won.
+
+**Replicated cells are scored by complete separation** — a winner is declared
+only when every replicate of one arm beats every replicate of the other. That
+test needs no distributional assumption, which is what makes it usable at n=3.
+Single-run cells fall back to a per-metric noise floor, which is weaker: a floor
+guessed in advance once suppressed a real result here and caused a true finding
+to be retracted upstream (see `docs/FINDINGS.md`, Round 4).
+
+The committed dataset (3 replicates per cell, CV 0.3–3.4%, every row separated):
+
+| Regime | allocs/req | bytes/req | CPU |
+|---|---|---|---|
+| HTTP/1.1 | **−36.3%** | **−90.3%** | +15.3% |
+| HTTP/2 | **−77.8%** | **−94.5%** | **−15.6%** |
+| HTTP/3 | +9.0% | +123.0% | **−14.5%** |
+| gRPC | **−64.7%** | **+166.5%** | **−20.9%** |
+
+Bold is a poseidon win. The HTTP/1.1 CPU loss is understood and filed upstream
+as [#355](https://github.com/lodgvideon/poseidon-http-client/issues/355) and
+[#356](https://github.com/lodgvideon/poseidon-http-client/issues/356): a context
+watchdog armed on every I/O call, and a missing write buffer that turns each
+header line into its own TLS record. Both are already solved in poseidon's own
+HTTP/2 layer, which is why H2 wins CPU.
 
 ### Two things to know before quoting the bytes/request row
 

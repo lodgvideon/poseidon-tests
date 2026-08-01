@@ -223,12 +223,15 @@ def load_reports(directory):
     could not be parsed.
     """
     runs = {}
+    reps = {}
     load_errors = {}
     extra_files = []
     unreadable = set()
     known_regimes = {key for key, _ in REGIMES}
 
-    for path in sorted(directory.glob("*.json")):
+    # Replicates live in rep*/ subdirectories (results/<dir>/rep1/h1-poseidon.json).
+    # A flat directory is still valid and is simply treated as n=1.
+    for path in sorted(directory.glob("*.json")) + sorted(directory.glob("rep*/*.json")):
         if path.name == OUTPUT_NAME:
             continue
         stem = path.stem
@@ -251,11 +254,15 @@ def load_reports(directory):
             continue
 
         if recognized:
-            runs[(regime, arm)] = data
+            # runs keeps one representative record per cell so every existing
+            # validity check is unchanged; reps keeps them all, and only the
+            # metric tables aggregate across them.
+            runs.setdefault((regime, arm), data)
+            reps.setdefault((regime, arm), []).append(data)
         else:
             extra_files.append(path.name)
 
-    return runs, load_errors, extra_files, unreadable
+    return runs, reps, load_errors, extra_files, unreadable
 
 
 # ---------------------------------------------------------------------------
@@ -291,23 +298,96 @@ def delta_and_verdict(poseidon_value, standard_value, heading=""):
     return text, verdict
 
 
-def render_metric_table(heading, extract, fmt, runs):
-    lines = [
-        "## {}".format(heading),
-        "",
-        "| Regime | poseidon | standard | Δ | verdict |",
-        "| --- | ---: | ---: | ---: | --- |",
-    ]
+def mean(values):
+    return sum(values) / len(values) if values else None
+
+
+def cv_pct(values):
+    """Coefficient of variation in percent, or None below 2 samples."""
+    if len(values) < 2:
+        return None
+    m = mean(values)
+    if not m:
+        return None
+    var = sum((v - m) ** 2 for v in values) / (len(values) - 1)
+    return (var ** 0.5) / abs(m) * 100.0
+
+
+def separated(a, b):
+    """True when every sample of one arm beats every sample of the other.
+
+    This is the strongest simple evidence that a delta is real, and it needs no
+    distributional assumption -- which is what makes it usable at n=3. It is
+    the test that made the H1 CPU result solid enough to reverse an upstream
+    retraction, after a noise floor guessed in advance had wrongly suppressed it.
+    """
+    if len(a) < 2 or len(b) < 2:
+        return None
+    return max(a) < min(b) or min(a) > max(b)
+
+
+def cell_series(reps, regime, arm, extract):
+    """Every replicate's value of one metric for one cell."""
+    out = []
+    for record in reps.get((regime, arm), []):
+        value = extract(record)
+        if value is not None:
+            out.append(value)
+    return out
+
+
+def render_metric_table(heading, extract, fmt, reps):
+    """One table per metric, aggregating replicates when they exist.
+
+    With n > 1 the verdict stops depending on a floor chosen in advance and
+    starts depending on the data: a winner is declared only when the two arms'
+    replicate ranges do not overlap. The floor remains the fallback for n = 1.
+    """
+    replicated = any(len(v) > 1 for v in reps.values())
+    if replicated:
+        header = "| Regime | poseidon | standard | Δ | n | CV | verdict |"
+        rule = "| --- | ---: | ---: | ---: | ---: | ---: | --- |"
+    else:
+        header = "| Regime | poseidon | standard | Δ | verdict |"
+        rule = "| --- | ---: | ---: | ---: | --- |"
+    lines = ["## {}".format(heading), "", header, rule]
+
     for regime, label in REGIMES:
-        poseidon = extract(runs.get((regime, "poseidon")))
-        standard = extract(runs.get((regime, "standard")))
+        p_vals = cell_series(reps, regime, "poseidon", extract)
+        s_vals = cell_series(reps, regime, "standard", extract)
+        poseidon, standard = mean(p_vals), mean(s_vals)
         delta, verdict = delta_and_verdict(poseidon, standard, heading)
-        lines.append(
-            "| {} | {} | {} | {} | {} |".format(
-                label, fmt(poseidon), fmt(standard), delta, verdict
-            )
-        )
+
+        if not replicated:
+            lines.append("| {} | {} | {} | {} | {} |".format(
+                label, fmt(poseidon), fmt(standard), delta, verdict))
+            continue
+
+        n = min(len(p_vals), len(s_vals))
+        sep = separated(p_vals, s_vals)
+        cvs = [c for c in (cv_pct(p_vals), cv_pct(s_vals)) if c is not None]
+        cv_text = "{:.1f}%".format(max(cvs)) if cvs else MISSING
+
+        if sep is not None and poseidon is not None and standard is not None:
+            if not sep:
+                verdict = "overlapping"
+            elif poseidon < standard:
+                verdict = "poseidon better"
+            else:
+                verdict = "standard better"
+
+        lines.append("| {} | {} | {} | {} | {} | {} | {} |".format(
+            label, fmt(poseidon), fmt(standard), delta,
+            n or MISSING, cv_text, verdict))
+
     lines.append("")
+    if replicated:
+        lines.append(
+            "*Replicated cells are scored by complete separation - every replicate of one "
+            "arm beating every replicate of the other - not against a noise floor. "
+            "`overlapping` means the ranges overlap, so no winner is claimed. CV is the "
+            "larger of the two arms'.*")
+        lines.append("")
     return lines
 
 
@@ -571,7 +651,7 @@ def render_raw(runs):
 # ---------------------------------------------------------------------------
 
 
-def build_document(directory, runs, load_errors, extra_files, unreadable):
+def build_document(directory, runs, reps, load_errors, extra_files, unreadable):
     lines = [
         "# poseidon-http-client vs standard clients",
         "",
@@ -583,7 +663,7 @@ def build_document(directory, runs, load_errors, extra_files, unreadable):
     ]
 
     for heading, extract, fmt in METRICS:
-        lines.extend(render_metric_table(heading, extract, fmt, runs))
+        lines.extend(render_metric_table(heading, extract, fmt, reps))
 
     lines.extend(
         render_validity(
@@ -609,8 +689,8 @@ def main(argv):
         )
         return 2
 
-    runs, load_errors, extra_files, unreadable = load_reports(directory)
-    document = build_document(directory, runs, load_errors, extra_files, unreadable)
+    runs, reps, load_errors, extra_files, unreadable = load_reports(directory)
+    document = build_document(directory, runs, reps, load_errors, extra_files, unreadable)
 
     sys.stdout.write(document)
 

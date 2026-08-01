@@ -18,14 +18,13 @@ prof*/
 
 # Run output. scripts/run.sh defaults to OUTDIR=results, so a local matrix run
 # lands directly in results/ — that is someone's machine's numbers, not the
-# repo's. results/rehearsal/ is the one committed sample and is negated below.
+# repo's. results/replicated/ is the one committed dataset and is negated below.
 #
 # The two-line form is required: git does not descend into an excluded
-# directory, so a bare `results/` followed by `!results/rehearsal/` would
-# silently keep ignoring the sample.
+# directory, so a bare `results/` followed by `!results/replicated/` would
+# silently keep ignoring it.
 /results/*
-!/results/rehearsal/
-!/results/cpu-replicates/
+!/results/replicated/
 
 # Editor / OS noise
 .idea/
