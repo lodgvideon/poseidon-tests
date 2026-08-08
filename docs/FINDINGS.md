@@ -773,3 +773,75 @@ H1's CPU loss settles at +15.3%, against the +21.6% a single run showed.
 The bytes/request row still carries the idiom caveat from Round 3 — against a `net/http` arm
 that pools its read buffer, poseidon's H1/H2 advantage is −60.3%/−82.9% rather than
 −90%/−94%. The allocation-count row does not.
+
+---
+
+## Round 6 — re-measured against the fixes, and a stale-image near-miss
+
+The client was updated from `bf099fa` to `main` @ `62fdeec` (105 commits), which carries
+fixes for several defects reported from this harness. Re-measured, 3 replicates per cell.
+
+### The fixes are substantial
+
+| Regime | allocs/req before → after | vs standard before → after |
+|---|---|---|
+| HTTP/1.1 | 38 → 32 (−17%) | −36.3% → **−47.0%** |
+| HTTP/2 | 11 → 8 (−28%) | −77.8% → **−84.1%** |
+| HTTP/3 | 161 → 92 (**−43%**) | **+9.0% → −37.5%** |
+| gRPC | 31 → 27 (−14%) | −64.7% → **−69.5%** |
+
+| Regime | bytes/req before → after | vs standard before → after |
+|---|---|---|
+| HTTP/1.1 | 2,360 → 1,886 | −90.3% → −92.2% |
+| HTTP/2 | 1,548 → 527 (**−66%**) | −94.5% → **−98.1%** |
+| HTTP/3 | 67,303 → 60,092 | +123.0% → +98.7% |
+| gRPC | 77,715 → 52,656 (**−32%**) | +166.5% → **+80.7%** |
+
+**HTTP/3's allocation count flipped from the one regime poseidon lost (+9.0%) to a
+decisive win (−37.5%)** — poseidon now wins allocation count in all four regimes. The H1
+CPU gap fell from +15.3% to +5.9% and is now *overlapping*, i.e. no longer distinguishable;
+consistent with #356's request-head coalescing landing.
+
+### The near-miss: a stale image nearly produced the opposite conclusion
+
+The first re-run showed the numbers **barely moving**, and the write-up was going to be
+"the fixes had no measurable effect". That was wrong: `build-and-load.sh` had not actually
+rebuilt, so the matrix measured the *previous* client.
+
+Worse, the check that should have caught it was itself invalid. Inspecting the image
+binary's embedded module version reported the new client — but only because a diagnostic
+`docker build` run *after* the matrix had rebuilt the image in the meantime. The artifact
+inspected was not the artifact that ran.
+
+What settled it was an A/B of two locally-built drivers, old and new, alternating on one
+host: H3 allocations 253.6 → 110.8 (−56%), gRPC bytes 77,175 → 52,118 (−32%). The fixes
+plainly worked; the cluster run had measured the wrong binary.
+
+`build-and-load.sh` now extracts the driver from the built image and compares its
+**embedded module versions** against `go.mod`, refusing to proceed on a mismatch. Go
+records those in the binary, so the check is exact and costs nothing. It caught a real
+drift on its first run.
+
+This is the same failure this document has recorded repeatedly — a measurement that looks
+clean while describing something other than what it claims. The new entry in the pattern:
+**"the image is present" is not "the image is current", and verifying an artifact after
+other commands have touched it verifies nothing.**
+
+### Issue state, read from source rather than from labels
+
+Six of the nine reported issues are marked closed. Reading the module source at `62fdeec`:
+
+- **#345 fixed.** `sort.Slice` and the per-packet crypto scratch escapes are gone from the
+  QUIC path — this is most of the −43% H3 allocation drop.
+- **#356 fixed**, and better than proposed: rather than a `bufio.Writer`, a reusable
+  `headBuf` coalesces the request head into a single `Write`, with a comment explaining it
+  avoids pinning the persistent 4–16 KiB a `bufio.Writer` would.
+- **#341 and #346 appear untouched** — `recycleStream` still re-mints the events channel at
+  `conn/stream.go:399`, and `grpc.Stream` is still `&Stream{s: s}` per call with no pool.
+  gRPC bytes nevertheless fell 32%, so that row improved by some other route.
+- **#355 appears untouched** — `armCh`/`disarmCh` are still unbuffered and `armWatch` still
+  arms unconditionally on any cancellable context.
+
+Recorded as an observation, not a complaint: the numbers are what they are, and three
+closed issues whose described mechanism is still present is worth knowing when reading
+them later.

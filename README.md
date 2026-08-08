@@ -58,13 +58,18 @@ Prometheus + Grafana scrape the same numbers continuously for a live view of
 the run; pprof heap profiles at both plateau boundaries give per-callsite
 allocation attribution.
 
-**The CPU column is weak and labelled as such.** At 200 RPS the driver runs at
-5–8% of one core, and running one arm against itself gives a 13.4% coefficient
-of variation — a ~30% minimum resolvable delta between single runs. `report.py`
-refuses to give a verdict below that, printing "below noise floor" instead. The
-allocation columns are exact runtime counters and are the trustworthy output.
-Go's own `/cpu/classes/*` metrics are **not** used, because they only refresh
-during a GC cycle and freeze entirely on a low-allocating arm.
+**The CPU column is the weak one.** At 200 RPS the driver runs at 5–8% of one
+core, so run-to-run variation is a large share of any delta — on a quiet host
+per-arm CV is ~1%, on a busy one it reaches 13%. Replicated cells therefore
+claim a winner only on complete separation, and print `overlapping` otherwise;
+single-run cells fall back to a 10% floor. The allocation columns are exact
+runtime counters and are the trustworthy output.
+
+Go's own `/cpu/classes/*` metrics are **not** used: they only refresh at GC mark
+termination, so differencing them spans *[last GC before start, last GC before
+end]* rather than the plateau — and the error is arm-correlated, because GC
+frequency tracks allocation rate. The driver still records them as
+`cpu_runtime_seconds` alongside a validity flag, purely as a cross-check.
 
 ## Running it
 
@@ -159,21 +164,27 @@ Single-run cells fall back to a per-metric noise floor, which is weaker: a floor
 guessed in advance once suppressed a real result here and caused a true finding
 to be retracted upstream (see `docs/FINDINGS.md`, Round 4).
 
-The committed dataset (3 replicates per cell, CV 0.3–3.4%, every row separated):
+The committed dataset (3 replicates per cell, arms alternated):
 
 | Regime | allocs/req | bytes/req | CPU |
 |---|---|---|---|
-| HTTP/1.1 | **−36.3%** | **−90.3%** | +15.3% |
-| HTTP/2 | **−77.8%** | **−94.5%** | **−15.6%** |
-| HTTP/3 | +9.0% | +123.0% | **−14.5%** |
-| gRPC | **−64.7%** | **+166.5%** | **−20.9%** |
+| HTTP/1.1 | **−47.0%** | **−92.2%** | +5.9% (overlapping) |
+| HTTP/2 | **−84.1%** | **−98.1%** | −6.8% (overlapping) |
+| HTTP/3 | **−37.5%** | +98.7% | **−17.2%** |
+| gRPC | **−69.5%** | +80.7% | **−21.9%** |
 
-Bold is a poseidon win. The HTTP/1.1 CPU loss is understood and filed upstream
-as [#355](https://github.com/lodgvideon/poseidon-http-client/issues/355) and
-[#356](https://github.com/lodgvideon/poseidon-http-client/issues/356): a context
-watchdog armed on every I/O call, and a missing write buffer that turns each
-header line into its own TLS record. Both are already solved in poseidon's own
-HTTP/2 layer, which is why H2 wins CPU.
+Bold is a poseidon win; `overlapping` means the replicate ranges overlap, so no
+winner is claimed. **poseidon wins the allocation count in all four regimes.**
+
+Measured against poseidon-http-client `main` @ `62fdeec`, which carries fixes
+for several defects this harness reported. The previous pin
+(`bf099fa`) scored −36.3% / −77.8% / **+9.0%** / −64.7% on allocations: HTTP/3
+flipped from a loss to a decisive win, and the HTTP/1.1 CPU gap fell from +15.3%
+to statistically indistinguishable. What remains is the HTTP/3 and gRPC byte
+volume, still tracked upstream as
+[#342](https://github.com/lodgvideon/poseidon-http-client/issues/342),
+[#347](https://github.com/lodgvideon/poseidon-http-client/issues/347) and
+[#348](https://github.com/lodgvideon/poseidon-http-client/issues/348).
 
 ### Two things to know before quoting the bytes/request row
 

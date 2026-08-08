@@ -73,4 +73,43 @@ for node in $NODES; do
   fi
 done
 
+# Verify the image actually carries the dependency versions go.mod asks for.
+#
+# "Image present" is not the same as "image current". A stale image will run,
+# produce clean-looking numbers, and silently answer a question about the wrong
+# code — which happened: a matrix run reported that a batch of upstream fixes
+# had no effect, when it had simply measured the previous build. A local A/B of
+# the two client versions showed the fixes cut H3 allocations by 56%.
+#
+# Go binaries embed their module versions, so this is cheap and exact.
+echo "==> verifying image dependency versions match go.mod"
+CID="$(docker create "$IMAGE")"
+trap 'rm -f "$TAR"; docker rm -f "$CID" >/dev/null 2>&1 || true' EXIT
+docker cp "$CID:/driver" "$TAR.driver" >/dev/null
+
+mismatch=0
+while read -r mod want; do
+  [ -n "$mod" ] || continue
+  got="$(go version -m "$TAR.driver" 2>/dev/null \
+        | awk -v m="$mod" '$1=="dep" && $2==m {print $3; exit}')"
+  if [ -z "$got" ]; then
+    echo "    $mod: NOT LINKED into the image binary" >&2
+    mismatch=1
+  elif [ "$got" != "$want" ]; then
+    echo "    $mod: image has $got, go.mod wants $want" >&2
+    mismatch=1
+  else
+    echo "    $mod: $got OK"
+  fi
+done <<EOF
+$(go list -m -f '{{if not .Main}}{{.Path}} {{.Version}}{{end}}' all 2>/dev/null | grep '^github.com/lodgvideon/')
+EOF
+rm -f "$TAR.driver"
+
+if [ "$mismatch" -ne 0 ]; then
+  echo "error: the loaded image does not match go.mod — results from it would" >&2
+  echo "       describe the wrong code. Try: docker build --no-cache -t $IMAGE ." >&2
+  exit 1
+fi
+
 echo "==> done: $IMAGE available on all nodes"
